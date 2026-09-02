@@ -1,0 +1,277 @@
+diff --git a/keystore/src/software.rs b/keystore/src/software.rs
+index 5879724..43b830a 100644
+--- a/keystore/src/software.rs
++++ b/keystore/src/software.rs
+@@ -1,4 +1,11 @@
+-use std::{collections::HashMap, io::Cursor, sync::RwLock};
++use std::{
++    collections::HashMap,
++    io::{Cursor, Write},
++    path::Path,
++    sync::{OnceLock, RwLock},
++};
++#[cfg(unix)]
++use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+ 
+ use aes_gcm::{Aes256Gcm, Nonce, aead::Aead};
+ use openssl::{bn::BigNumContext, derive::Deriver, ec::{EcGroup, EcGroupRef, EcKey, EcPoint}, encrypt::{Decrypter, Encrypter}, hash::MessageDigest, nid::Nid, pkey::{PKey, Private}, rsa::{Padding, Rsa}, sign::{Signer, Verifier}};
+@@ -167,6 +174,174 @@ impl SoftwareKeystoreEncryptor for SoftwareEncryptor {
+     }
+ }
+ 
++const PERSISTED_STATE_MAGIC: &[u8] = b"HERMES_RUSTPUSH_STATE\x01";
++static PERSISTED_STATE_KEY: OnceLock<[u8; 32]> = OnceLock::new();
++
++/// Install the process-local key used to protect rustpush state at rest.
++/// The key is expected to come from the local OS credential store. A second
++/// initialization is accepted only when it supplies the identical key.
++pub fn init_persisted_state_encryption(key: [u8; 32]) -> Result<(), KeystoreError> {
++    if let Some(existing) = PERSISTED_STATE_KEY.get() {
++        if existing == &key {
++            return Ok(());
++        }
++        return Err(KeystoreError::KeystoreError(
++            "persisted-state encryption already initialized with a different key".into(),
++        ));
++    }
++    PERSISTED_STATE_KEY.set(key).map_err(|_| {
++        KeystoreError::KeystoreError("failed to initialize persisted-state encryption".into())
++    })
++}
++
++fn persisted_state_key() -> Result<&'static [u8; 32], KeystoreError> {
++    PERSISTED_STATE_KEY.get().ok_or_else(|| {
++        KeystoreError::KeystoreError("persisted-state encryption is not initialized".into())
++    })
++}
++
++fn validate_purpose(purpose: &str) -> Result<(), KeystoreError> {
++    if purpose.is_empty()
++        || purpose.len() > u16::MAX as usize
++        || !purpose
++            .bytes()
++            .all(|byte| byte.is_ascii_alphanumeric() || b"._:-/".contains(&byte))
++    {
++        return Err(KeystoreError::KeystoreError(
++            "invalid persisted-state purpose".into(),
++        ));
++    }
++    Ok(())
++}
++
++/// Encrypt one state blob and bind it to a non-secret purpose label. The
++/// purpose is inside the authenticated ciphertext, preventing one valid state
++/// file from being substituted for another.
++pub fn encrypt_persisted_state(
++    purpose: &str,
++    plaintext: &[u8],
++) -> Result<Vec<u8>, KeystoreError> {
++    validate_purpose(purpose)?;
++    let purpose_bytes = purpose.as_bytes();
++    let mut envelope = Vec::with_capacity(2 + purpose_bytes.len() + plaintext.len());
++    envelope.extend_from_slice(&(purpose_bytes.len() as u16).to_be_bytes());
++    envelope.extend_from_slice(purpose_bytes);
++    envelope.extend_from_slice(plaintext);
++
++    let ciphertext = contained_gcm_encrypt(persisted_state_key()?, &envelope);
++    envelope.fill(0);
++    let ciphertext = ciphertext?;
++    let mut protected = Vec::with_capacity(PERSISTED_STATE_MAGIC.len() + ciphertext.len());
++    protected.extend_from_slice(PERSISTED_STATE_MAGIC);
++    protected.extend_from_slice(&ciphertext);
++    Ok(protected)
++}
++
++/// Decrypt a state blob. Plaintext files and blobs for a different purpose are
++/// rejected rather than accepted as a migration fallback.
++pub fn decrypt_persisted_state(
++    purpose: &str,
++    protected: &[u8],
++) -> Result<Vec<u8>, KeystoreError> {
++    validate_purpose(purpose)?;
++    let ciphertext = protected
++        .strip_prefix(PERSISTED_STATE_MAGIC)
++        .ok_or_else(|| KeystoreError::KeystoreError("unencrypted persisted state rejected".into()))?;
++    let mut envelope = contained_gcm_decrypt(persisted_state_key()?, ciphertext)?;
++    if envelope.len() < 2 {
++        envelope.fill(0);
++        return Err(KeystoreError::KeystoreError(
++            "invalid persisted-state envelope".into(),
++        ));
++    }
++    let purpose_len = u16::from_be_bytes([envelope[0], envelope[1]]) as usize;
++    let purpose_end = 2usize.checked_add(purpose_len).ok_or_else(|| {
++        KeystoreError::KeystoreError("invalid persisted-state envelope".into())
++    })?;
++    if purpose_end > envelope.len() || &envelope[2..purpose_end] != purpose.as_bytes() {
++        envelope.fill(0);
++        return Err(KeystoreError::KeystoreError(
++            "persisted-state purpose mismatch".into(),
++        ));
++    }
++    let plaintext = envelope[purpose_end..].to_vec();
++    envelope.fill(0);
++    Ok(plaintext)
++}
++
++/// Read and decrypt an optional persisted-state file.
++pub fn read_persisted_state(
++    path: &Path,
++    purpose: &str,
++) -> Result<Option<Vec<u8>>, KeystoreError> {
++    match std::fs::read(path) {
++        Ok(protected) => decrypt_persisted_state(purpose, &protected).map(Some),
++        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
++        Err(_) => Err(KeystoreError::KeystoreError(
++            "failed to read persisted state".into(),
++        )),
++    }
++}
++
++/// Encrypt and atomically replace one persisted-state file with restrictive
++/// permissions. The parent directory is kept owner-only on Unix platforms.
++pub fn write_persisted_state(
++    path: &Path,
++    purpose: &str,
++    plaintext: &[u8],
++) -> Result<(), KeystoreError> {
++    let protected = encrypt_persisted_state(purpose, plaintext)?;
++    let parent = path.parent().ok_or_else(|| {
++        KeystoreError::KeystoreError("persisted-state path has no parent".into())
++    })?;
++    std::fs::create_dir_all(parent).map_err(|_| {
++        KeystoreError::KeystoreError("failed to create persisted-state directory".into())
++    })?;
++    #[cfg(unix)]
++    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(|_| {
++        KeystoreError::KeystoreError("failed to secure persisted-state directory".into())
++    })?;
++
++    let file_name = path.file_name().and_then(|name| name.to_str()).ok_or_else(|| {
++        KeystoreError::KeystoreError("invalid persisted-state filename".into())
++    })?;
++    let temp_path = parent.join(format!(
++        ".{file_name}.{}.{}.tmp",
++        std::process::id(),
++        rand::thread_rng().next_u64()
++    ));
++    let result = (|| -> Result<(), KeystoreError> {
++        let mut options = std::fs::OpenOptions::new();
++        options.write(true).create_new(true);
++        #[cfg(unix)]
++        options.mode(0o600);
++        let mut file = options.open(&temp_path).map_err(|_| {
++            KeystoreError::KeystoreError("failed to create persisted-state temp file".into())
++        })?;
++        file.write_all(&protected).map_err(|_| {
++            KeystoreError::KeystoreError("failed to write persisted state".into())
++        })?;
++        file.sync_all().map_err(|_| {
++            KeystoreError::KeystoreError("failed to sync persisted state".into())
++        })?;
++        std::fs::rename(&temp_path, path).map_err(|_| {
++            KeystoreError::KeystoreError("failed to replace persisted state".into())
++        })?;
++        #[cfg(unix)]
++        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(|_| {
++            KeystoreError::KeystoreError("failed to secure persisted-state file".into())
++        })?;
++        if let Ok(directory) = std::fs::File::open(parent) {
++            let _ = directory.sync_all();
++        }
++        Ok(())
++    })();
++    if result.is_err() {
++        let _ = std::fs::remove_file(&temp_path);
++    }
++    result
++}
++
+ impl<T: Keystore> SoftwareKeystoreEncryptor for T {
+     fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+         self.ensure_exists("keystore:software:encryptor", KeyType::Aes(256), KeystoreAccessRules {
+@@ -214,18 +389,30 @@ pub(crate) fn digest_to_md(digest: KeystoreDigest) -> MessageDigest {
+ }
+ 
+ pub(crate) fn contained_gcm_encrypt(key: &[u8], secret: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+-    let cipher = Aes256Gcm::new_from_slice(key).unwrap();
++    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| {
++        KeystoreError::KeystoreError("invalid software-encryption key".into())
++    })?;
+ 
+     let nonce: [u8; 12] = rand::random();
+-    let cipher = cipher.encrypt(Nonce::from_slice(&nonce), &*secret).expect("Failed to GCM");
++    let cipher = cipher.encrypt(Nonce::from_slice(&nonce), secret).map_err(|_| {
++        KeystoreError::KeystoreError("software encryption failed".into())
++    })?;
+ 
+     Ok([nonce.to_vec(), cipher].concat())
+ }
+ 
+ pub(crate) fn contained_gcm_decrypt(key: &[u8], text: &[u8]) -> Result<Vec<u8>, KeystoreError> {
+-    let cipher = Aes256Gcm::new_from_slice(&key).unwrap();
+-                
+-    Ok(cipher.decrypt(Nonce::from_slice(&text[..12]), &text[12..]).expect("Failed to GCM"))
++    if text.len() < 12 {
++        return Err(KeystoreError::KeystoreError(
++            "invalid software-encryption envelope".into(),
++        ));
++    }
++    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| {
++        KeystoreError::KeystoreError("invalid software-encryption key".into())
++    })?;
++    cipher
++        .decrypt(Nonce::from_slice(&text[..12]), &text[12..])
++        .map_err(|_| KeystoreError::KeystoreError("software decryption failed".into()))
+ }
+ 
+ impl<T: SoftwareKeystoreEncryptor> SoftwareKeystore<T> {
+diff --git a/src/ids/identity_manager.rs b/src/ids/identity_manager.rs
+index 2e8f21d..cc5085e 100644
+--- a/src/ids/identity_manager.rs
++++ b/src/ids/identity_manager.rs
+@@ -1,4 +1,4 @@
+-use std::{collections::{HashMap, HashSet}, fs, io::Cursor, path::PathBuf, sync::{Arc, Weak}, time::{Duration, SystemTime, UNIX_EPOCH}};
++use std::{collections::{HashMap, HashSet}, io::Cursor, path::PathBuf, sync::{Arc, Weak}, time::{Duration, SystemTime, UNIX_EPOCH}};
+ 
+ use backon::{ConstantBuilder, ExponentialBuilder};
+ use deku::{DekuContainerRead, DekuRead, DekuWrite};
+@@ -19,6 +19,7 @@ use std::fmt::Debug;
+ use crate::{aps::new_aps_id, ids::link::QuickRelayAllocationsResponse, util::{DebugMutex, DebugRwLock}};
+ 
+ use crate::{APSConnectionResource, APSMessage, IDSUser, MessageInst, OSConfig, PushError, aps::{APSConnection, APSInterestToken, get_message}, ids::{MessageBody, user::{IDSError, IDSLookupUser}}, register, util::{Resource, ResourceManager, base64_decode, base64_encode, bin_deserialize, bin_deserialize_sha, bin_serialize, duration_since_epoch, encode_hex, plist_to_bin, plist_to_string, ungzip}};
++use keystore::software::{read_persisted_state, write_persisted_state};
+ 
+ use super::{user::{IDSDeliveryData, IDSNGMIdentity, IDSPublicIdentity, IDSService, IDSUserIdentity, IDSUserType, PrivateDeviceInfo, QueryOptions, ReportMessage}, CertifiedContext, IDSRecvMessage};
+ 
+@@ -183,7 +184,7 @@ pub struct KeyCache {
+ impl KeyCache {
+     pub async fn new(path: PathBuf, conn: &APSConnectionResource, users: &[IDSUser], services: &[&IDSService]) -> KeyCache {
+         let mut message_counter = HashMap::new();
+-        if let Ok(data) = fs::read(&path) {
++        if let Ok(Some(data)) = read_persisted_state(&path, "id-cache.plist") {
+             if let Ok(mut loaded) = plist::from_reader_xml::<_, KeyCache>(Cursor::new(&data)) {
+                 loaded.cache_location = path;
+                 loaded.verity(conn, users, services).await;
+@@ -240,8 +241,19 @@ impl KeyCache {
+     }
+ 
+     pub fn save(&self) {
+-        let saved = plist_to_string(self).unwrap();
+-        fs::write(&self.cache_location, saved).unwrap();
++        let Ok(saved) = plist_to_string(self) else {
++            warn!("Failed to serialize encrypted IDS key cache");
++            return;
++        };
++        if write_persisted_state(
++            &self.cache_location,
++            "id-cache.plist",
++            saved.as_bytes(),
++        )
++        .is_err()
++        {
++            warn!("Failed to persist encrypted IDS key cache");
++        }
+     }
+ 
+     pub fn invalidate(&mut self, handle: &str, keys_for: &str) {

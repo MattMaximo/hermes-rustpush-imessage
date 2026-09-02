@@ -1,0 +1,878 @@
+diff --git a/Makefile b/Makefile
+index b8a94c2..27e6421 100644
+--- a/Makefile
++++ b/Makefile
+@@ -251,7 +251,7 @@ ensure-rustpush-source:
+ 	  '^    pub expiration: SystemTime,'
+ 	@$(RP_PATCH) rp_patch "FetchedToken re-export" $(APA_DIR)/icloud-auth/src/lib.rs \
+ 	  's/^pub use client::\{AppleAccount, LoginState,/pub use client::{AppleAccount, FetchedToken, LoginState,/' \
+-	  'pub use client::\{AppleAccount, FetchedToken,'
++	  'pub use client::\{[^}]*FetchedToken'
+ # Ignore self-exclusion in fast_forward_trust (Clique self-eviction fix; ports 9f29ff1).
+ 	@$(RP_PATCH) rp_patch "keychain self-exclusion" $(RUSTPUSH_DIR)/src/icloud/keychain.rs \
+ 	  's/^            for excluded in &trust\.excludeds \{$$/            let my_id = &state.user_identity.as_ref().unwrap().identifier;\n            for excluded in &trust.excludeds {\n                if excluded == my_id {\n                    warn!(\n                        "Ignoring exclusion of ourselves ({}) from peer {}",\n                        excluded,\n                        peer.0.hash.as_ref().unwrap()\n                    );\n                    continue;\n                }/' \
+diff --git a/pkg/connector/client.go b/pkg/connector/client.go
+index f6fb0be..08f4b4e 100644
+--- a/pkg/connector/client.go
++++ b/pkg/connector/client.go
+@@ -1577,8 +1577,13 @@ func (c *IMClient) Connect(ctx context.Context) {
+ 			log.Warn().Msg("Local macOS contacts unavailable — contact names will not be resolved")
+ 		}
+ 	} else {
+-		cloudContacts := newCloudContactsClient(c.client, log)
+-		if cloudContacts != nil {
++		var cloudContacts *cloudContactsClient
++		if !c.Main.Config.DisableICloudContacts {
++			cloudContacts = newCloudContactsClient(c.client, log)
++		}
++		if c.Main.Config.DisableICloudContacts {
++			log.Info().Msg("iCloud contacts disabled before CardDAV setup")
++		} else if cloudContacts != nil {
+ 			c.contacts = cloudContacts
+ 			log.Info().Str("url_host", logSafeURL(cloudContacts.baseURL)).Msg("Cloud contacts available (iCloud CardDAV)")
+ 			if syncErr := cloudContacts.SyncContacts(log); syncErr != nil {
+diff --git a/pkg/connector/config.go b/pkg/connector/config.go
+index 0e83e1a..94b2319 100644
+--- a/pkg/connector/config.go
++++ b/pkg/connector/config.go
+@@ -130,6 +130,9 @@ type IMConfig struct {
+ 	// When configured, this is used instead of iCloud CardDAV contacts.
+ 	CardDAV CardDAVConfig `yaml:"carddav"`
+ 
++	// DisableICloudContacts disables iCloud CardDAV and remote shared-profile refresh.
++	DisableICloudContacts bool `yaml:"disable_icloud_contacts"`
++
+ 	// DebugDisablePrivacy is a DEVELOPMENT-ONLY switch that reverts the
+ 	// bridge's privacy protections so plaintext is observable for debugging.
+ 	// MUST be false in any real deployment. Default false. When true:
+@@ -250,6 +253,7 @@ func upgradeConfig(helper up.Helper) {
+ 	helper.Copy(up.Bool, "statuskit_notifications")
+ 	helper.Copy(up.Bool, "read_receipts")
+ 	helper.Copy(up.Bool, "typing_notifications")
++	helper.Copy(up.Bool, "disable_icloud_contacts")
+ 	helper.Copy(up.Str, "carddav", "email")
+ 	helper.Copy(up.Str, "carddav", "url")
+ 	helper.Copy(up.Str, "carddav", "username")
+diff --git a/pkg/connector/shared_profile.go b/pkg/connector/shared_profile.go
+index 669ab72..e87d548 100644
+--- a/pkg/connector/shared_profile.go
++++ b/pkg/connector/shared_profile.go
+@@ -384,7 +384,7 @@ func (c *IMClient) applyCachedSharedProfilesToGhosts(log zerolog.Logger) {
+ // handleSharedProfile path and bypass this throttle, so profile changes
+ // the peer iPhone announces are still applied immediately.
+ func (c *IMClient) refreshAllSharedProfiles(log zerolog.Logger) {
+-	if c.sharedProfileStore == nil || c.client == nil {
++	if c.Main.Config.DisableICloudContacts || c.sharedProfileStore == nil || c.client == nil {
+ 		return
+ 	}
+ 	rows, err := c.sharedProfileStore.loadAll(context.Background())
+diff --git a/pkg/imconfig/example-config.yaml b/pkg/imconfig/example-config.yaml
+index e355e63..f6d1b45 100644
+--- a/pkg/imconfig/example-config.yaml
++++ b/pkg/imconfig/example-config.yaml
+@@ -107,6 +107,10 @@ read_receipts: true
+ # typing indicators from iMessage contacts are unaffected.
+ typing_notifications: true
+ 
++# Disable iCloud CardDAV and remote shared-profile refresh when the public
++# contacts-auth path is unavailable. Messages and history backfill continue.
++disable_icloud_contacts: false
++
+ # External CardDAV server for contact name resolution.
+ # Works with Google (app passwords), Nextcloud, Radicale, Fastmail, etc.
+ # When configured, this is used instead of iCloud contacts.
+diff --git a/pkg/rustpushgo/Cargo.lock b/pkg/rustpushgo/Cargo.lock
+index b2d80ef..26e95a1 100644
+--- a/pkg/rustpushgo/Cargo.lock
++++ b/pkg/rustpushgo/Cargo.lock
+@@ -3593,6 +3593,7 @@ dependencies = [
+  "reqwest",
+  "rustls 0.23.43",
+  "rustpush",
++ "security-framework",
+  "serde",
+  "serde_json",
+  "sha1",
+diff --git a/pkg/rustpushgo/Cargo.toml b/pkg/rustpushgo/Cargo.toml
+index 22a6002..1b40a9b 100644
+--- a/pkg/rustpushgo/Cargo.toml
++++ b/pkg/rustpushgo/Cargo.toml
+@@ -67,7 +67,7 @@ tokio = { version = "1", features = ["full"] }
+ futures = "0.3"
+ uniffi = { version = "0.25.0", features = ["tokio"] }
+ pretty_env_logger = "0.5.0"
+-log = "0.4.20"
++log = { version = "0.4.20", features = ["release_max_level_off"] }
+ rustpush = { path = "../../third_party/rustpush-upstream", default-features = false, features = ["macos-validation-data"] }
+ icloud_auth = { path = "../../third_party/rustpush-upstream/third_party/apple-private-apis/icloud-auth", default-features = false }
+ omnisette = { path = "../../third_party/rustpush-upstream/third_party/apple-private-apis/omnisette", default-features = false }
+@@ -133,6 +133,9 @@ rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"]
+ once_cell = "1"
+ rand = { version = "0.8.5", features = ["min_const_gen"] }
+ 
++[target.'cfg(target_os = "macos")'.dependencies]
++security-framework = "=3.7.0"
++
+ [build-dependencies]
+ uniffi = { version = "0.25.0", features = ["build"] }
+ cc = "1.0"
+diff --git a/pkg/rustpushgo/src/lib.rs b/pkg/rustpushgo/src/lib.rs
+index ee00e4e..a6857a1 100644
+--- a/pkg/rustpushgo/src/lib.rs
++++ b/pkg/rustpushgo/src/lib.rs
+@@ -9,11 +9,11 @@ mod statuskit_cloudkit;
+ #[cfg(test)]
+ mod test_hwinfo;
+ 
+-use std::{collections::HashMap, io::Cursor, path::PathBuf, str::FromStr, sync::Arc, time::Duration, sync::atomic::{AtomicU64, Ordering}};
++use std::{collections::HashMap, io::Cursor, path::{Path, PathBuf}, sync::{Arc, OnceLock}, time::Duration, sync::atomic::{AtomicU64, Ordering}};
+ 
+ use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
+ use icloud_auth::AppleAccount;
+-use keystore::{init_keystore, keystore, software::{NoEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
++use keystore::{init_keystore, keystore, software::{decrypt_persisted_state, encrypt_persisted_state, init_persisted_state_encryption, read_persisted_state, write_persisted_state, SoftwareEncryptor, SoftwareKeystore, SoftwareKeystoreState}};
+ use log::{debug, error, info, warn};
+ use rustpush::{
+     authenticate_apple, login_apple_delegates, register, APSConnectionResource,
+@@ -35,8 +35,6 @@ use rustpush::cloudkit_proto::request_operation::header::IsolationLevel;
+ use rustpush::facetime::{FACETIME_SERVICE, VIDEO_SERVICE};
+ use rustpush::findmy::MULTIPLEX_SERVICE;
+ 
+-use std::sync::RwLock;
+-
+ // ============================================================================
+ // Anisette provider selection
+ // ============================================================================
+@@ -60,14 +58,15 @@ fn bridge_default_provider(
+     path: PathBuf,
+     device_id: String,
+ ) -> omnisette::ArcAnisetteClient<BridgeDefaultAnisetteProvider> {
+-    // The omnisette provider selected with `cleanroom-registration` takes a
+-    // `device_id`; upstream OpenBubbles omnisette's `default_provider` is 2-arg.
+-    // Gate on the feature so both signatures build: with cleanroom-registration
+-    // the 3-arg call is used; without it (this from-source build) the 2-arg
+-    // upstream signature is used.
++    // The pinned public upstream provider accepts login info and its state
++    // path in every feature shape used by this source build.
++    // Keep device_id at the wrapper boundary for callers while using that
++    // two-argument API.
++    // Both cfg arms intentionally use the same public signature.
+     #[cfg(feature = "cleanroom-registration")]
+     {
+-        omnisette::default_provider(info, path, device_id)
++        let _ = device_id; // pinned public provider is two-argument
++        omnisette::default_provider(info, path)
+     }
+     #[cfg(not(feature = "cleanroom-registration"))]
+     {
+@@ -1471,20 +1470,8 @@ async fn create_keychain_clients(
+         token_provider: token_provider.clone(),
+     });
+     let keychain_state_path = format!("{}/trustedpeers.plist", resolve_xdg_data_dir());
+-    let mut keychain_state: Option<rustpush::keychain::KeychainClientState> = match std::fs::read(&keychain_state_path) {
+-        Ok(data) => match plist::from_bytes(&data) {
+-            Ok(state) => Some(state),
+-            Err(e) => {
+-                warn!("Failed to parse keychain state at {}: {}", keychain_state_path, e);
+-                None
+-            }
+-        },
+-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+-        Err(e) => {
+-            warn!("Failed to read keychain state at {}: {}", keychain_state_path, e);
+-            None
+-        }
+-    };
++    let mut keychain_state =
++        read_plist_state::<rustpush::keychain::KeychainClientState>(&keychain_state_path);
+     if keychain_state.is_none() {
+         keychain_state = Some(
+             rustpush::keychain::KeychainClientState::new(dsid.clone(), adsid.clone(), &mme_delegate)
+@@ -1498,11 +1485,7 @@ async fn create_keychain_clients(
+             state: rustpush::DebugRwLock::new(keychain_state.expect("keychain state missing")),
+         config: os_config.clone(),
+         update_state: Box::new(move |state| {
+-            if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
+-                warn!("Failed to persist keychain state to {}: {}", path_for_closure, e);
+-            } else {
+-                info!("Persisted keychain state to {}", path_for_closure);
+-            }
++            persist_plist_state(&path_for_closure, state);
+         }),
+         container: tokio::sync::Mutex::new(None),
+         security_container: tokio::sync::Mutex::new(None),
+@@ -4090,6 +4073,152 @@ fn message_inst_to_wrapped(msg: &MessageInst) -> WrappedMessage {
+ /// rustpush's own chatter at WARN and keep this wrapper's diagnostics at INFO.
+ const DEFAULT_RUST_LOG: &str = "warn,rustpush=warn,rustpushgo=info";
+ 
++const STATE_KEYCHAIN_SERVICE: &str = "ai.hermes.rustpush";
++const STATE_KEYCHAIN_ACCOUNT: &str = "state-encryption-key.v1";
++const KEYSTORE_STATE_PURPOSE: &str = "keystore.plist";
++static SECURE_RUNTIME_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
++
++fn wrapped_security_error(message: impl Into<String>) -> WrappedError {
++    WrappedError::GenericError {
++        msg: message.into(),
++    }
++}
++
++#[cfg(target_os = "macos")]
++fn load_or_create_state_key() -> Result<[u8; 32], String> {
++    use security_framework::passwords::{get_generic_password, set_generic_password};
++    use security_framework::random::SecRandom;
++
++    const ITEM_NOT_FOUND: i32 = -25300;
++
++    fn key_from_bytes(mut bytes: Vec<u8>) -> Result<[u8; 32], String> {
++        if bytes.len() != 32 {
++            bytes.fill(0);
++            return Err("macOS Keychain rustpush state key has an invalid length".into());
++        }
++        let mut key = [0u8; 32];
++        key.copy_from_slice(&bytes);
++        bytes.fill(0);
++        Ok(key)
++    }
++
++    match get_generic_password(STATE_KEYCHAIN_SERVICE, STATE_KEYCHAIN_ACCOUNT) {
++        Ok(bytes) => key_from_bytes(bytes),
++        Err(error) if error.code() == ITEM_NOT_FOUND => {
++            let mut generated = [0u8; 32];
++            SecRandom::default()
++                .copy_bytes(&mut generated)
++                .map_err(|_| "failed to generate the rustpush state key".to_string())?;
++            set_generic_password(
++                STATE_KEYCHAIN_SERVICE,
++                STATE_KEYCHAIN_ACCOUNT,
++                &generated,
++            )
++            .map_err(|error| {
++                format!(
++                    "failed to store the rustpush state key in macOS Keychain (OSStatus {})",
++                    error.code()
++                )
++            })?;
++
++            let verified = get_generic_password(STATE_KEYCHAIN_SERVICE, STATE_KEYCHAIN_ACCOUNT)
++                .map_err(|error| {
++                    format!(
++                        "failed to verify the rustpush state key in macOS Keychain (OSStatus {})",
++                        error.code()
++                    )
++                })?;
++            let verified = key_from_bytes(verified)?;
++            if verified != generated {
++                generated.fill(0);
++                return Err("macOS Keychain rustpush state-key verification failed".into());
++            }
++            Ok(generated)
++        }
++        Err(error) => Err(format!(
++            "failed to read the rustpush state key from macOS Keychain (OSStatus {})",
++            error.code()
++        )),
++    }
++}
++
++#[cfg(not(target_os = "macos"))]
++fn load_or_create_state_key() -> Result<[u8; 32], String> {
++    Err("Keychain-backed rustpush state is supported only on macOS".into())
++}
++
++fn initialize_secure_runtime_inner() -> Result<(), String> {
++    let key = load_or_create_state_key()?;
++    init_persisted_state_encryption(key)
++        .map_err(|_| "failed to initialize rustpush state encryption".to_string())?;
++
++    let xdg_dir = resolve_xdg_data_dir();
++    let state_path = PathBuf::from(&xdg_dir).join("keystore.plist.enc");
++    let state = match read_persisted_state(&state_path, KEYSTORE_STATE_PURPOSE)
++        .map_err(|_| "failed to decrypt the rustpush software keystore".to_string())?
++    {
++        Some(mut plaintext) => {
++            let parsed = plist::from_bytes::<SoftwareKeystoreState>(&plaintext)
++                .map_err(|_| {
++                    "failed to parse the decrypted rustpush software keystore".to_string()
++                });
++            plaintext.fill(0);
++            parsed?
++        }
++        None => SoftwareKeystoreState::default(),
++    };
++
++    let persist_path = state_path.clone();
++    init_keystore(SoftwareKeystore {
++        state: std::sync::RwLock::new(state),
++        update_state: Box::new(move |state| {
++            let mut plaintext = Vec::new();
++            plist::to_writer_binary(&mut plaintext, state)
++                .expect("failed to serialize the rustpush software keystore");
++            write_persisted_state(&persist_path, KEYSTORE_STATE_PURPOSE, &plaintext)
++                .expect("failed to persist the encrypted rustpush software keystore");
++            plaintext.fill(0);
++        }),
++        encryptor: SoftwareEncryptor(key),
++    });
++    Ok(())
++}
++
++fn ensure_secure_runtime() -> Result<(), WrappedError> {
++    match SECURE_RUNTIME_RESULT.get_or_init(initialize_secure_runtime_inner) {
++        Ok(()) => Ok(()),
++        Err(message) => Err(wrapped_security_error(message.clone())),
++    }
++}
++
++/// Initialize the Keychain-backed state-encryption boundary before making any
++/// Apple network connection. This function is idempotent and fails closed.
++#[uniffi::export]
++pub fn init_secure_runtime() -> Result<(), WrappedError> {
++    ensure_secure_runtime()
++}
++
++/// Encrypt adapter-owned rustpush state for local persistence.
++#[uniffi::export]
++pub fn protect_state(purpose: String, mut plaintext: Vec<u8>) -> Result<Vec<u8>, WrappedError> {
++    ensure_secure_runtime()?;
++    let result = encrypt_persisted_state(&purpose, &plaintext)
++        .map_err(|_| wrapped_security_error("failed to encrypt rustpush state"));
++    plaintext.fill(0);
++    result
++}
++
++/// Decrypt adapter-owned rustpush state. Plaintext and purpose mismatches are
++/// rejected; there is deliberately no insecure migration fallback.
++#[uniffi::export]
++pub fn unprotect_state(purpose: String, mut protected: Vec<u8>) -> Result<Vec<u8>, WrappedError> {
++    ensure_secure_runtime()?;
++    let result = decrypt_persisted_state(&purpose, &protected)
++        .map_err(|_| wrapped_security_error("failed to decrypt rustpush state"));
++    protected.fill(0);
++    result
++}
++
+ /// Foreign log sink. The Go bridge implements this so every Rust log record
+ /// that passes the `RUST_LOG` filter lands in the bridge's own logger, and
+ /// therefore in `bridge.log`, instead of in the separate stdout capture that
+@@ -4587,118 +4716,84 @@ pub fn init_logger() {
+         default_hook(info);
+     }));
+ 
+-    // Initialize the keystore with a file-backed software keystore.
+-    // This must be called before any rustpush operations (APNs connect, login, etc.).
+-    //
+-    // The keystore lives alongside session.json in the XDG data directory
+-    // (~/.local/share/corten-matrix/) so that all session state is in one
+-    // place and easy to migrate between machines.
+-    let xdg_dir = resolve_xdg_data_dir();
+-    let state_path = format!("{}/keystore.plist", xdg_dir);
+-    let _ = std::fs::create_dir_all(&xdg_dir);
+-
+-    // Migrate from the old location (state/keystore.plist relative to working
+-    // directory) if the new file doesn't exist yet.
+-    let legacy_path = "state/keystore.plist";
+-    if !std::path::Path::new(&state_path).exists() {
+-        if std::path::Path::new(legacy_path).exists() {
+-            match std::fs::copy(legacy_path, &state_path) {
+-                Ok(_) => info!(
+-                    "Migrated keystore from {} to {}",
+-                    legacy_path, state_path
+-                ),
+-                Err(e) => warn!(
+-                    "Failed to migrate keystore from {} to {}: {}",
+-                    legacy_path, state_path, e
+-                ),
+-            }
+-        }
+-    }
+-
+-    let state: SoftwareKeystoreState = match std::fs::read(&state_path) {
+-        Ok(data) => plist::from_bytes(&data).unwrap_or_else(|e| {
+-            warn!("Failed to parse keystore at {}: {} — starting with empty keystore", state_path, e);
+-            SoftwareKeystoreState::default()
+-        }),
+-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+-            info!("No keystore file at {} — starting fresh", state_path);
+-            SoftwareKeystoreState::default()
+-        }
+-        Err(e) => {
+-            warn!("Failed to read keystore at {}: {} — starting with empty keystore", state_path, e);
+-            SoftwareKeystoreState::default()
+-        }
+-    };
+-    let path_for_closure = state_path.clone();
+-    init_keystore(SoftwareKeystore {
+-        state: RwLock::new(state),
+-        update_state: Box::new(move |s| {
+-            let _ = plist::to_file_xml(&path_for_closure, s);
+-        }),
+-        encryptor: NoEncryptor,
+-    });
++    // Refuse to initialize rustpush unless every persisted-state path is
++    // protected by the local Keychain-backed encryption boundary.
++    ensure_secure_runtime().expect("failed to initialize secure rustpush state");
+ }
+ 
+-/// Resolve the XDG data directory for corten-matrix session state.
++/// Resolve the dedicated local state directory for the Hermes rustpush adapter.
+ /// Uses $XDG_DATA_HOME if set, otherwise ~/.local/share.
+-/// Returns the full path: <base>/corten-matrix
+ fn resolve_xdg_data_dir() -> String {
+     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+         if !xdg.is_empty() {
+-            return format!("{}/corten-matrix", xdg);
++            return format!("{}/hermes-rustpush", xdg);
+         }
+     }
+-    if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
+-        return format!("{}/.local/share/corten-matrix", home);
++    if let Some(home) = std::env::var("HOME").ok().filter(|home| !home.is_empty()) {
++        return format!("{}/.local/share/hermes-rustpush", home);
+     }
+-    // Last resort — fall back to old relative path
+-    warn!("Could not determine HOME or XDG_DATA_HOME, using local state directory");
+-    "state".to_string()
++    panic!("HOME or XDG_DATA_HOME is required for secure rustpush state");
+ }
+ 
+ pub(crate) fn subsystem_state_path(file_name: &str) -> String {
+     let xdg_dir = resolve_xdg_data_dir();
+-    let _ = std::fs::create_dir_all(&xdg_dir);
++    std::fs::create_dir_all(&xdg_dir)
++        .expect("failed to create the secure rustpush state directory");
++    #[cfg(unix)]
++    {
++        use std::os::unix::fs::PermissionsExt;
++        std::fs::set_permissions(&xdg_dir, std::fs::Permissions::from_mode(0o700))
++            .expect("failed to secure the rustpush state directory");
++    }
+     format!("{}/{}", xdg_dir, file_name)
+ }
+ 
++fn state_file_purpose(path: &str) -> Option<String> {
++    Path::new(path)
++        .file_name()
++        .and_then(|name| name.to_str())
++        .map(str::to_owned)
++}
++
+ pub(crate) fn read_plist_state<T: serde::de::DeserializeOwned>(path: &str) -> Option<T> {
+-    match std::fs::read(path) {
+-        Ok(data) => match plist::from_bytes(&data) {
+-            Ok(state) => Some(state),
+-            Err(err) => {
+-                warn!("Failed to parse state at {}: {}", path, err);
+-                None
++    let Some(purpose) = state_file_purpose(path) else {
++        warn!("Rejected a rustpush state path without a valid filename");
++        return None;
++    };
++    match read_persisted_state(Path::new(path), &purpose) {
++        Ok(Some(mut plaintext)) => {
++            let parsed = plist::from_bytes(&plaintext);
++            plaintext.fill(0);
++            match parsed {
++                Ok(state) => Some(state),
++                Err(_) => {
++                    warn!("Failed to parse decrypted rustpush state: {}", purpose);
++                    None
++                }
+             }
+-        },
+-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+-        Err(err) => {
+-            warn!("Failed to read state at {}: {}", path, err);
++        }
++        Ok(None) => None,
++        Err(_) => {
++            warn!("Failed to decrypt rustpush state: {}", purpose);
+             None
+         }
+     }
+ }
+ 
+ pub(crate) fn persist_plist_state<T: serde::Serialize>(path: &str, state: &T) {
+-    // Write to a sibling tmp file, then atomic-rename. Sidesteps EACCES
+-    // when the existing file at `path` is owned by a UID different from
+-    // the current bridge process (stranded from a prior deploy under a
+-    // different uid/gid — seen on Beeper-hosted infra where plist files
+-    // landed as 0644 owned by a previous deploy's user, leaving the
+-    // current bridge with read-but-not-write access). The tmp file
+-    // inherits our uid; rename(2) replaces the old inode regardless of
+-    // its ownership, since we own the parent directory.
+-    let tmp_path = format!("{}.tmp.{}", path, std::process::id());
+-    let write_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+-        let mut file = std::fs::File::create(&tmp_path)?;
+-        plist::to_writer_xml(&mut file, state)?;
+-        file.sync_all()?;
+-        std::fs::rename(&tmp_path, path)?;
+-        Ok(())
+-    })();
+-    if let Err(err) = write_result {
+-        let _ = std::fs::remove_file(&tmp_path);
+-        warn!("Failed to persist state to {}: {}", path, err);
++    let Some(purpose) = state_file_purpose(path) else {
++        warn!("Rejected a rustpush state path without a valid filename");
++        return;
++    };
++    let mut plaintext = Vec::new();
++    if plist::to_writer_binary(&mut plaintext, state).is_err() {
++        warn!("Failed to serialize rustpush state: {}", purpose);
++        return;
++    }
++    let result = write_persisted_state(Path::new(path), &purpose, &plaintext);
++    plaintext.fill(0);
++    if result.is_err() {
++        warn!("Failed to persist encrypted rustpush state: {}", purpose);
+     }
+ }
+ 
+@@ -5207,6 +5302,7 @@ pub async fn connect(
+     config: &WrappedOSConfig,
+     state: &WrappedAPSState,
+ ) -> Arc<WrappedAPSConnection> {
++    ensure_secure_runtime().expect("failed to initialize Keychain-backed rustpush state");
+     ensure_crypto_provider();
+     // Keep TCP keep-alive + a write timeout applied to the APNs courier socket so
+     // a half-open/wedged connection errors out (~90-120s) and rustpush's
+@@ -5323,6 +5419,7 @@ pub async fn login_start(
+     config: &WrappedOSConfig,
+     connection: &WrappedAPSConnection,
+ ) -> Result<Arc<LoginSession>, WrappedError> {
++    ensure_secure_runtime()?;
+     ensure_crypto_provider();
+     let os_config = config.config.clone();
+     let conn = connection.inner.clone();
+@@ -5336,24 +5433,7 @@ pub async fn login_start(
+         hasher.update(password.trim().as_bytes());
+         hasher.finalize().to_vec()
+     };
+-    {
+-        // Diagnostic: confirm the password reaching us is the raw user password and
+-        // not HTML/markdown-escaped or truncated by the matrix input layer. Compare
+-        // pw_sha256 to `printf %s 'yourpassword' | shasum -a 256` to verify.
+-        let tp = password.trim();
+-        let html_escaped = tp.contains("&amp;") || tp.contains("&lt;") || tp.contains("&gt;")
+-            || tp.contains("&quot;") || tp.contains("&#") || tp.contains("&apos;");
+-        let pw_hex: String = pw_bytes.iter().map(|b| format!("{:02x}", b)).collect();
+-        info!("LOGIN-DEBUG user={:?} user_len={} pw_raw_bytes={} pw_trim_chars={} pw_trim_bytes={} pw_html_escaped={} pw_sha256={}",
+-            user_trimmed, user_trimmed.len(), password.len(), tp.chars().count(), tp.len(), html_escaped, pw_hex);
+-    }
+-
+     let client_info = os_config.get_gsa_config(&*conn.state.read().await, false);
+-    info!("login_start: mme_client_info={}", client_info.mme_client_info);
+-    info!("login_start: mme_client_info_akd={}", client_info.mme_client_info_akd);
+-    info!("login_start: akd_user_agent={}", client_info.akd_user_agent);
+-    info!("login_start: hardware_headers={:?}", client_info.hardware_headers);
+-    info!("login_start: push_token={:?}", client_info.push_token);
+     // Persist the provisioned ADI machine in the absolute XDG data dir (same place
+     // every other subsystem uses), NOT a cwd-relative path. With the relative
+     // "state/anisette" the machine was re-provisioned on every login (state.plist
+@@ -6279,13 +6359,9 @@ impl WrappedStatusKitClient {
+     /// plist file directly.
+     pub async fn get_known_handles(&self) -> Vec<String> {
+         let state_path = subsystem_state_path("statuskit-state.plist");
+-        let data = match std::fs::read(&state_path) {
+-            Ok(d) => d,
+-            Err(_) => return Vec::new(),
+-        };
+-        let value = match plist::from_bytes::<plist::Value>(&data) {
+-            Ok(v) => v,
+-            Err(_) => return Vec::new(),
++        let value = match read_plist_state::<plist::Value>(&state_path) {
++            Some(value) => value,
++            None => return Vec::new(),
+         };
+         let Some(dict) = value.as_dictionary() else { return Vec::new() };
+         let Some(keys_dict) = dict.get("keys").and_then(|v| v.as_dictionary()) else {
+@@ -6537,13 +6613,14 @@ pub async fn new_client(
+     message_callback: Box<dyn MessageCallback>,
+     update_users_callback: Box<dyn UpdateUsersCallback>,
+ ) -> Result<Arc<Client>, WrappedError> {
++    ensure_secure_runtime()?;
+     ensure_crypto_provider();
+     let conn = connection.inner.clone();
+     let users_clone = users.inner.clone();
+     let identity_clone = identity.inner.clone();
+     let config_clone = config.config.clone();
+ 
+-    let _ = std::fs::create_dir_all("state");
++    let id_cache_path = PathBuf::from(subsystem_state_path("id-cache.plist"));
+ 
+     // FACETIME + VIDEO are in the bundle so the IdentityResource's `services`
+     // slice contains them. Without that, the `get_main_service` (called
+@@ -6564,7 +6641,7 @@ pub async fn new_client(
+             users_clone,
+             identity_clone,
+             &[&MADRID_SERVICE, &MULTIPLEX_SERVICE, &FACETIME_SERVICE, &VIDEO_SERVICE],
+-            "state/id_cache.plist".into(),
++            id_cache_path,
+             config_clone.clone(),
+             Box::new(move |updated_keys| {
+                 update_users_callback.update_users(Arc::new(WrappedIDSUsers {
+@@ -7890,20 +7967,8 @@ impl Client {
+         });
+ 
+         let keychain_state_path = format!("{}/trustedpeers.plist", resolve_xdg_data_dir());
+-        let mut keychain_state: Option<rustpush::keychain::KeychainClientState> = match std::fs::read(&keychain_state_path) {
+-            Ok(data) => match plist::from_bytes(&data) {
+-                Ok(state) => Some(state),
+-                Err(e) => {
+-                    warn!("Failed to parse keychain state at {}: {}", keychain_state_path, e);
+-                    None
+-                }
+-            },
+-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+-            Err(e) => {
+-                warn!("Failed to read keychain state at {}: {}", keychain_state_path, e);
+-                None
+-            }
+-        };
++        let mut keychain_state =
++            read_plist_state::<rustpush::keychain::KeychainClientState>(&keychain_state_path);
+         if keychain_state.is_none() {
+             keychain_state = Some(
+                 rustpush::keychain::KeychainClientState::new(dsid, adsid, &mme_delegate)
+@@ -7920,9 +7985,7 @@ impl Client {
+             state: rustpush::DebugRwLock::new(keychain_state.expect("keychain state missing")),
+             config: os_config,
+             update_state: Box::new(move |state| {
+-                if let Err(e) = plist::to_file_xml(&path_for_closure, state) {
+-                    warn!("Failed to persist keychain state to {}: {}", path_for_closure, e);
+-                }
++                persist_plist_state(&path_for_closure, state);
+             }),
+             container: tokio::sync::Mutex::new(None),
+             security_container: tokio::sync::Mutex::new(None),
+@@ -8528,46 +8591,44 @@ impl Client {
+                 std::collections::HashMap::new();
+             let mut chan_live: std::collections::HashMap<String, bool> =
+                 std::collections::HashMap::new();
+-            if let Ok(data) = std::fs::read(&state_path) {
+-                if let Ok(value) = plist::from_bytes::<plist::Value>(&data) {
+-                    let root = value.as_dictionary();
+-                    if let Some(keys_dict) =
+-                        root.and_then(|d| d.get("keys")).and_then(|v| v.as_dictionary())
+-                    {
+-                        for (cid, entry) in keys_dict {
+-                            if let Some(from_str) = entry
+-                                .as_dictionary()
+-                                .and_then(|d| d.get("from"))
+-                                .and_then(|v| v.as_string())
+-                            {
+-                                chan_by_from
+-                                    .entry(from_str.to_string())
+-                                    .or_default()
+-                                    .push(cid.clone());
+-                            }
++            if let Some(value) = read_plist_state::<plist::Value>(&state_path) {
++                let root = value.as_dictionary();
++                if let Some(keys_dict) =
++                    root.and_then(|d| d.get("keys")).and_then(|v| v.as_dictionary())
++                {
++                    for (cid, entry) in keys_dict {
++                        if let Some(from_str) = entry
++                            .as_dictionary()
++                            .and_then(|d| d.get("from"))
++                            .and_then(|v| v.as_string())
++                        {
++                            chan_by_from
++                                .entry(from_str.to_string())
++                                .or_default()
++                                .push(cid.clone());
+                         }
+                     }
+-                    if let Some(recents) = root
+-                        .and_then(|d| d.get("recent_channels"))
+-                        .and_then(|v| v.as_array())
+-                    {
+-                        for rc in recents {
+-                            let Some(rc) = rc.as_dictionary() else { continue };
+-                            let Some(id_bytes) = rc
+-                                .get("identifier")
+-                                .and_then(|v| v.as_dictionary())
+-                                .and_then(|d| d.get("id"))
+-                                .and_then(|v| v.as_data())
+-                            else {
+-                                continue;
+-                            };
+-                            let live = rc
+-                                .get("last_msg_ns")
+-                                .and_then(|v| v.as_unsigned_integer())
+-                                .unwrap_or(0)
+-                                > 1;
+-                            chan_live.insert(base64_encode(id_bytes), live);
+-                        }
++                }
++                if let Some(recents) = root
++                    .and_then(|d| d.get("recent_channels"))
++                    .and_then(|v| v.as_array())
++                {
++                    for rc in recents {
++                        let Some(rc) = rc.as_dictionary() else { continue };
++                        let Some(id_bytes) = rc
++                            .get("identifier")
++                            .and_then(|v| v.as_dictionary())
++                            .and_then(|d| d.get("id"))
++                            .and_then(|v| v.as_data())
++                        else {
++                            continue;
++                        };
++                        let live = rc
++                            .get("last_msg_ns")
++                            .and_then(|v| v.as_unsigned_integer())
++                            .unwrap_or(0)
++                            > 1;
++                        chan_live.insert(base64_encode(id_bytes), live);
+                     }
+                 }
+             }
+@@ -8582,14 +8643,12 @@ impl Client {
+                 std::collections::HashMap::new();
+             {
+                 let dates_path = subsystem_state_path("statuskit-channel-dates.plist");
+-                if let Ok(data) = std::fs::read(&dates_path) {
+-                    if let Ok(plist::Value::Dictionary(d)) =
+-                        plist::from_bytes::<plist::Value>(&data)
+-                    {
+-                        for (cid, v) in d {
+-                            if let Some(i) = v.as_signed_integer() {
+-                                chan_date.insert(cid, i);
+-                            }
++                if let Some(plist::Value::Dictionary(d)) =
++                    read_plist_state::<plist::Value>(&dates_path)
++                {
++                    for (cid, v) in d {
++                        if let Some(i) = v.as_signed_integer() {
++                            chan_date.insert(cid, i);
+                         }
+                     }
+                 }
+@@ -8664,9 +8723,7 @@ impl Client {
+                     .recent_channels
+                     .retain(|rc| !prune.contains(&base64_encode(&rc.identifier.id)));
+                 let remaining_keys = state.keys.len();
+-                if let Err(e) = plist::to_file_xml(&state_path, &*state) {
+-                    warn!("StatusKit: failed to persist pruned state: {}", e);
+-                }
++                persist_plist_state(&state_path, &*state);
+                 drop(state);
+                 info!(
+                     "StatusKit: pruned {} dead channel(s) from {} over-budget handle(s); state.keys now {} channel(s)",
+@@ -8691,21 +8748,19 @@ impl Client {
+             std::collections::HashMap::new();
+         {
+             let state_path = subsystem_state_path("statuskit-state.plist");
+-            if let Ok(data) = std::fs::read(&state_path) {
+-                if let Ok(value) = plist::from_bytes::<plist::Value>(&data) {
+-                    if let Some(keys_dict) = value
+-                        .as_dictionary()
+-                        .and_then(|d| d.get("keys"))
+-                        .and_then(|v| v.as_dictionary())
+-                    {
+-                        for (_channel_id, entry) in keys_dict {
+-                            if let Some(from_str) = entry
+-                                .as_dictionary()
+-                                .and_then(|d| d.get("from"))
+-                                .and_then(|v| v.as_string())
+-                            {
+-                                *from_counts.entry(from_str.to_string()).or_insert(0) += 1;
+-                            }
++            if let Some(value) = read_plist_state::<plist::Value>(&state_path) {
++                if let Some(keys_dict) = value
++                    .as_dictionary()
++                    .and_then(|d| d.get("keys"))
++                    .and_then(|v| v.as_dictionary())
++                {
++                    for (_channel_id, entry) in keys_dict {
++                        if let Some(from_str) = entry
++                            .as_dictionary()
++                            .and_then(|d| d.get("from"))
++                            .and_then(|v| v.as_string())
++                        {
++                            *from_counts.entry(from_str.to_string()).or_insert(0) += 1;
+                         }
+                     }
+                 }
+@@ -9554,28 +9609,12 @@ impl Client {
+         match self.send_with_flap_retry(&mut msg).await {
+             Ok(_) => Ok(msg.id.clone()),
+             Err(rustpush::PushError::NoValidTargets) if !conversation.is_sms => {
+-                // iMessage failed — no IDS targets. Falling back to SMS is what an
+-                // iPhone does, but it only delivers if a device on this account
+-                // relays text messages. Without one the retry is accepted by Apple
+-                // and silently discarded, and we would return Ok for a message that
+-                // never went anywhere. Fail instead so the bridge can surface it.
+-                if !self.has_sms_relay(handle.clone()).await {
+-                    return Err(WrappedError::NoSmsRelay);
+-                }
+-                info!("No IDS targets, falling back to SMS for {:?}", conv.participants);
+-                let sms_service = MessageType::SMS {
+-                    is_phone: false,
+-                    using_number: handle.clone(),
+-                    from_handle: None,
+-                };
+-                let mut sms_msg = MessageInst::new(
+-                    conv,
+-                    &handle,
+-                    Message::Message(NormalMessage::new(actual_text, sms_service)),
+-                );
+-                self.send_with_flap_retry(&mut sms_msg).await
+-                    .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send SMS: {}", e) })?;
+-                Ok(sms_msg.id.clone())
++                // This bridge is deliberately iMessage-only. Never turn an IDS
++                // routing failure into an SMS relay send with different delivery
++                // semantics or potential carrier charges.
++                Err(WrappedError::GenericError {
++                    msg: "No registered iMessage targets".to_string(),
++                })
+             }
+             Err(e) => Err(WrappedError::GenericError { msg: format!("Failed to send message: {}", e) }),
+         }
+@@ -10335,43 +10374,9 @@ impl Client {
+         match self.send_with_flap_retry(&mut msg).await {
+             Ok(_) => Ok(msg.id.clone()),
+             Err(rustpush::PushError::NoValidTargets) if !conversation.is_sms => {
+-                // See send_message: an SMS fallback with no relay on the account is
+-                // accepted by Apple and discarded, so fail rather than report Ok.
+-                if !self.has_sms_relay(handle.clone()).await {
+-                    return Err(WrappedError::NoSmsRelay);
+-                }
+-                info!("No IDS targets for attachment, falling back to SMS for {:?}", conv.participants);
+-                let sms_service = MessageType::SMS {
+-                    is_phone: false,
+-                    using_number: handle.clone(),
+-                    from_handle: None,
+-                };
+-                let sms_parts = vec![IndexedMessagePart {
+-                    part: MessagePart::Attachment(attachment),
+-                    idx: None,
+-                    ext: None,
+-                }];
+-                let sms_subject = body.filter(|s| !s.is_empty());
+-                let mut sms_msg = MessageInst::new(
+-                    conv,
+-                    &handle,
+-                    Message::Message(NormalMessage {
+-                        parts: MessageParts(sms_parts),
+-                        effect: None,
+-                        reply_guid: reply_guid,
+-                        reply_part: reply_part,
+-                        service: sms_service,
+-                        subject: sms_subject,
+-                        app: None,
+-                        link_meta: None,
+-                        voice: is_voice,
+-                        scheduled: None,
+-                        embedded_profile: None,
+-                    }),
+-                );
+-                self.send_with_flap_retry(&mut sms_msg).await
+-                    .map_err(|e| WrappedError::GenericError { msg: format!("Failed to send SMS attachment: {}", e) })?;
+-                Ok(sms_msg.id.clone())
++                Err(WrappedError::GenericError {
++                    msg: "No registered iMessage targets".to_string(),
++                })
+             }
+             Err(e) => Err(WrappedError::GenericError { msg: format!("Failed to send attachment: {}", e) }),
+         }

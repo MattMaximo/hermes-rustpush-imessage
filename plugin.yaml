@@ -1,0 +1,18 @@
+name: imessage_cli-platform
+label: Local iMessage (RustPush)
+kind: platform
+version: 0.1.0
+description: >
+  Thin local-only Hermes adapter for a launchd-supervised RustPush sidecar over
+  a same-user mode-0600 Unix-domain socket. No relay, GUI automation, or
+  Messages.app control.
+author: boobutler
+optional_env:
+  - name: RUSTPUSH_ALLOWED_USERS
+    description: "Comma-separated iMessage handles allowed to contact Hermes"
+    prompt: "Allowed iMessage handles (comma-separated)"
+    password: false
+  - name: RUSTPUSH_ALLOW_ALL_USERS
+    description: "Allow any iMessage handle to contact Hermes (not recommended)"
+    prompt: "Allow all iMessage users? (true/false)"
+    password: false

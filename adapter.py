@@ -1,0 +1,825 @@
+"""Hermes adapter for the private local RustPush sidecar.
+
+The plugin only translates Hermes's generic platform contract to a local
+line-delimited JSON protocol. Apple protocol state and APNs/IDS connections
+remain in the supervised sidecar.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import stat
+import sys
+import time
+import uuid
+from collections import OrderedDict
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Awaitable, Callable, Dict, Optional
+
+from gateway.config import Platform
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    SendResult,
+    cache_media_bytes,
+)
+
+LOGGER = logging.getLogger("hermes.platforms.imessage")
+PLATFORM_NAME = "imessage_cli"
+PROTOCOL_VERSION = 1
+MAX_FRAME_BYTES = 1_048_576
+DEFAULT_SOCKET = Path.home() / ".hermes" / "rustpush" / "run" / "bridge.sock"
+NETWORK_KEY_PARTS = (
+    "endpoint",
+    "host",
+    "listen",
+    "network",
+    "port",
+    "proxy",
+    "relay",
+    "remote",
+    "tcp",
+    "telemetry",
+    "url",
+)
+
+
+class SidecarUnavailable(RuntimeError):
+    pass
+
+
+class SidecarRejected(RuntimeError):
+    def __init__(self, code: str):
+        self.code = code
+        super().__init__(code)
+
+
+class SidecarClient:
+    """One persistent authenticated-by-kernel UDS connection."""
+
+    def __init__(
+        self,
+        socket_path: Path,
+        on_event: Callable[[Dict[str, Any]], Awaitable[None]],
+    ) -> None:
+        self.socket_path = socket_path
+        self.on_event = on_event
+        self.reader: Optional[asyncio.StreamReader] = None
+        self.writer: Optional[asyncio.StreamWriter] = None
+        self.capabilities: set[str] = set()
+        self._reader_task: Optional[asyncio.Task] = None
+        self._write_lock = asyncio.Lock()
+        self._pending: Dict[str, asyncio.Future] = {}
+        self._event_tasks: set[asyncio.Task] = set()
+        self._closed = asyncio.Event()
+
+    def _verify_socket(self) -> None:
+        st = self.socket_path.lstat()
+        if not stat.S_ISSOCK(st.st_mode):
+            raise SidecarUnavailable("unavailable")
+        if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+            raise SidecarUnavailable("unavailable")
+
+    async def connect(self) -> Dict[str, Any]:
+        self._verify_socket()
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_unix_connection(str(self.socket_path)), timeout=5.0
+            )
+        except Exception:
+            raise SidecarUnavailable("unavailable") from None
+        self.reader, self.writer = reader, writer
+        request_id = uuid.uuid4().hex
+        await self._write(
+            {"request_id": request_id, "op": "hello", "protocol": PROTOCOL_VERSION}
+        )
+        response = await self._read_frame()
+        if (
+            response.get("request_id") != request_id
+            or response.get("ok") is not True
+            or not isinstance(response.get("result"), dict)
+        ):
+            await self.close()
+            raise SidecarUnavailable("protocol_error")
+        result = response["result"]
+        if result.get("protocol") != PROTOCOL_VERSION:
+            await self.close()
+            raise SidecarUnavailable("protocol_error")
+        capabilities = result.get("capabilities", [])
+        self.capabilities = {
+            value for value in capabilities if isinstance(value, str)
+        }
+        self._reader_task = asyncio.create_task(
+            self._reader_loop(), name="rustpush-plugin-reader"
+        )
+        return result
+
+    async def _read_frame(self) -> Dict[str, Any]:
+        if self.reader is None:
+            raise SidecarUnavailable("unavailable")
+        try:
+            line = await self.reader.readline()
+        except Exception:
+            raise SidecarUnavailable("unavailable") from None
+        if not line or len(line) > MAX_FRAME_BYTES:
+            raise SidecarUnavailable("protocol_error")
+        try:
+            value = json.loads(line)
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            raise SidecarUnavailable("protocol_error") from None
+        if not isinstance(value, dict):
+            raise SidecarUnavailable("protocol_error")
+        return value
+
+    async def _write(self, value: Dict[str, Any]) -> None:
+        writer = self.writer
+        if writer is None:
+            raise SidecarUnavailable("unavailable")
+        encoded = json.dumps(
+            value, separators=(",", ":"), ensure_ascii=False
+        ).encode("utf-8") + b"\n"
+        if len(encoded) > MAX_FRAME_BYTES:
+            raise SidecarRejected("request_too_large")
+        async with self._write_lock:
+            try:
+                writer.write(encoded)
+                await writer.drain()
+            except Exception:
+                raise SidecarUnavailable("unavailable") from None
+
+    async def request(self, op: str, **payload: Any) -> Dict[str, Any]:
+        if self._closed.is_set():
+            raise SidecarUnavailable("unavailable")
+        request_id = uuid.uuid4().hex
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        self._pending[request_id] = future
+        try:
+            await self._write({"request_id": request_id, "op": op, **payload})
+            response = await asyncio.wait_for(future, timeout=120.0)
+        except asyncio.TimeoutError:
+            raise SidecarUnavailable("timeout") from None
+        finally:
+            self._pending.pop(request_id, None)
+        if response.get("ok") is not True:
+            code = response.get("error", "transport_error")
+            raise SidecarRejected(code if isinstance(code, str) else "transport_error")
+        result = response.get("result", {})
+        if not isinstance(result, dict):
+            raise SidecarUnavailable("protocol_error")
+        return result
+
+    async def _reader_loop(self) -> None:
+        try:
+            while True:
+                frame = await self._read_frame()
+                event = frame.get("event")
+                if isinstance(event, dict):
+                    task = asyncio.create_task(
+                        self.on_event(event), name="rustpush-plugin-event"
+                    )
+                    self._event_tasks.add(task)
+                    task.add_done_callback(self._event_done)
+                    continue
+                request_id = frame.get("request_id")
+                future = self._pending.get(request_id)
+                if future is not None and not future.done():
+                    future.set_result(frame)
+        except (SidecarUnavailable, asyncio.CancelledError):
+            pass
+        finally:
+            for future in list(self._pending.values()):
+                if not future.done():
+                    future.set_exception(SidecarUnavailable("unavailable"))
+            self._closed.set()
+
+    def _event_done(self, task: asyncio.Task) -> None:
+        self._event_tasks.discard(task)
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            # The sidecar event stays unacked and is replayed after reconnect.
+            LOGGER.warning("iMessage inbound event deferred category=adapter_failure")
+
+    async def wait_closed(self) -> None:
+        await self._closed.wait()
+
+    async def close(self) -> None:
+        task = self._reader_task
+        self._reader_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        for event_task in list(self._event_tasks):
+            event_task.cancel()
+        if self._event_tasks:
+            await asyncio.gather(*self._event_tasks, return_exceptions=True)
+        self._event_tasks.clear()
+        writer = self.writer
+        self.writer = None
+        self.reader = None
+        if writer is not None:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+        self._closed.set()
+
+
+class RustPushIMessageAdapter(BasePlatformAdapter):
+    """Thin Hermes translation layer over the local RustPush process."""
+
+    supports_async_delivery = True
+    MAX_MESSAGE_LENGTH = 500_000
+
+    def __init__(self, config, *, _platform: Optional[Platform] = None) -> None:
+        extra = getattr(config, "extra", {}) or {}
+        if _has_network_configuration(extra):
+            raise ValueError("network configuration is not supported")
+        platform = _platform if _platform is not None else Platform(PLATFORM_NAME)
+        super().__init__(config=config, platform=platform)
+        raw_socket = str(extra.get("socket_path") or DEFAULT_SOCKET)
+        self.socket_path = Path(raw_socket).expanduser()
+        if not self.socket_path.is_absolute():
+            raise ValueError("socket_path must be absolute")
+        self._client: Optional[SidecarClient] = None
+        self._supervisor: Optional[asyncio.Task] = None
+        self._stop = asyncio.Event()
+        self._ready = asyncio.Event()
+        self._last_inbound: OrderedDict[str, str] = OrderedDict()
+        self._sent: OrderedDict[str, float] = OrderedDict()
+        self._processed_events: OrderedDict[str, float] = OrderedDict()
+
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        # The gateway supplies this keyword on both cold-start and recovery
+        # paths. RustPush owns its own persistent replay queue, so reconnects
+        # use the same sidecar handshake without resetting remote state.
+        del is_reconnect
+        self._stop.clear()
+        if self._supervisor is None or self._supervisor.done():
+            self._supervisor = asyncio.create_task(
+                self._connection_supervisor(), name="rustpush-plugin-supervisor"
+            )
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=20.0)
+        except asyncio.TimeoutError:
+            return False
+        return True
+
+    async def _connection_supervisor(self) -> None:
+        backoff = 0.25
+        while not self._stop.is_set():
+            client = SidecarClient(self.socket_path, self._on_event)
+            try:
+                await client.connect()
+            except (SidecarUnavailable, OSError):
+                await client.close()
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    backoff = min(backoff * 2, 5.0)
+                continue
+            self._client = client
+            self._ready.set()
+            self._mark_connected()
+            backoff = 0.25
+            LOGGER.info(
+                "iMessage local sidecar connected capabilities=%s",
+                len(client.capabilities),
+            )
+            await client.wait_closed()
+            if self._client is client:
+                self._client = None
+            self._ready.clear()
+            self._mark_disconnected()
+            await client.close()
+        self._ready.clear()
+        self._mark_disconnected()
+
+    async def disconnect(self) -> None:
+        self._stop.set()
+        self._ready.clear()
+        client = self._client
+        self._client = None
+        if client is not None:
+            await client.close()
+        task = self._supervisor
+        self._supervisor = None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        self._mark_disconnected()
+
+    async def _request(self, op: str, **payload: Any) -> Dict[str, Any]:
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            raise SidecarUnavailable("unavailable") from None
+        client = self._client
+        if client is None:
+            raise SidecarUnavailable("unavailable")
+        if op not in client.capabilities:
+            raise SidecarRejected("unsupported")
+        return await client.request(op, **payload)
+
+    def _remember(
+        self, mapping: OrderedDict[str, Any], key: str, value: Any, limit: int
+    ) -> None:
+        mapping[key] = value
+        mapping.move_to_end(key)
+        while len(mapping) > limit:
+            mapping.popitem(last=False)
+
+    async def _on_event(self, event: Dict[str, Any]) -> None:
+        event_id = event.get("event_id")
+        if not isinstance(event_id, str) or not event_id:
+            return
+        if event_id in self._processed_events:
+            await self._request("ack", event_id=event_id)
+            return
+        kind = event.get("kind")
+        if kind == "typing":
+            await self._forward_platform_event(event)
+            return
+        if event.get("from_me") is True:
+            native_id = event.get("native_id")
+            if isinstance(native_id, str) and native_id:
+                self._remember(self._sent, native_id, time.monotonic(), 2000)
+            await self._ack_processed(event_id)
+            return
+        if kind == "message":
+            await self._accept_message(event)
+        elif kind == "reaction":
+            await self._accept_reaction(event)
+        else:
+            await self._forward_platform_event(event)
+        await self._ack_processed(event_id)
+
+    async def _ack_processed(self, event_id: str) -> None:
+        self._remember(self._processed_events, event_id, time.monotonic(), 4096)
+        await self._request("ack", event_id=event_id)
+
+    def _source_for(self, event: Dict[str, Any]):
+        chat_id = str(event.get("chat_id") or "")
+        participants = event.get("participants")
+        count = len(participants) if isinstance(participants, list) else 0
+        chat_type = "group" if count > 1 or event.get("group_name") else "dm"
+        sender = event.get("sender")
+        sender_id = sender if isinstance(sender, str) else None
+        name = event.get("group_name")
+        return self.build_source(
+            chat_id=chat_id,
+            chat_name=name if isinstance(name, str) else None,
+            chat_type=chat_type,
+            user_id=sender_id,
+            user_name=None,
+        )
+
+    async def _forward_platform_event(self, event: Dict[str, Any]) -> None:
+        handler = getattr(self, "_platform_event_handler", None)
+        if handler is None:
+            return
+        kind = str(event.get("kind") or "unknown")
+        stable = {
+            "platform": PLATFORM_NAME,
+            "event_name": f"imessage:{kind}",
+            "event_id": event.get("event_id"),
+            "chat_id": event.get("chat_id"),
+            "sender": event.get("sender"),
+            "native_id": event.get("native_id"),
+            "timestamp_ms": event.get("timestamp_ms"),
+            "target_id": event.get("target_id"),
+            "target_part": event.get("target_part"),
+            "text": event.get("text"),
+            "reaction": event.get("emoji"),
+            "removed": event.get("remove"),
+            "typing": event.get("typing"),
+            "participants": event.get("participants"),
+            "group_name": event.get("group_name"),
+        }
+        await handler(stable, self._source_for(event))
+
+    async def _accept_message(self, event: Dict[str, Any]) -> None:
+        chat_id = event.get("chat_id")
+        native_id = event.get("native_id")
+        sender = event.get("sender")
+        if not all(isinstance(value, str) and value for value in (chat_id, native_id, sender)):
+            return
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        attachment_meta = event.get("attachments")
+        declared_attachment_count = 0
+        unavailable_attachment_count = 0
+        if isinstance(attachment_meta, list):
+            for item in attachment_meta:
+                if not isinstance(item, dict):
+                    continue
+                declared_attachment_count += 1
+                if item.get("available") is not True:
+                    unavailable_attachment_count += 1
+                    continue
+                # Accept the pre-contract-fix names while replaying any event
+                # persisted by an older sidecar, but emit only the canonical
+                # attachment_id/filename shape from the sidecar going forward.
+                attachment_id = item.get("attachment_id") or item.get("id")
+                if not isinstance(attachment_id, str):
+                    unavailable_attachment_count += 1
+                    continue
+                materialized: Optional[Path] = None
+                try:
+                    result = await self._request(
+                        "materialize_attachment", attachment_id=attachment_id
+                    )
+                    raw_path = result.get("path")
+                    if not isinstance(raw_path, str):
+                        continue
+                    materialized = Path(raw_path)
+                    data = materialized.read_bytes()
+                    cached = cache_media_bytes(
+                        data,
+                        filename=str(item.get("filename") or item.get("name") or "attachment.bin"),
+                        mime_type=str(item.get("mime") or "application/octet-stream"),
+                    )
+                    if cached is not None:
+                        media_urls.append(cached.path)
+                        media_types.append(cached.mime_type)
+                    else:
+                        unavailable_attachment_count += 1
+                except Exception:
+                    unavailable_attachment_count += 1
+                finally:
+                    try:
+                        await self._request(
+                            "release_attachment", attachment_id=attachment_id
+                        )
+                    except Exception:
+                        pass
+        text = event.get("text")
+        if not isinstance(text, str):
+            text = ""
+        # RustPush exposes an iMessage attachment balloon as U+FFFC in the
+        # flattened text. The actual payload is carried in attachments.
+        text = text.replace("\ufffc", "").strip()
+        if not text and media_urls:
+            text = "[Attachment]"
+        elif not text and declared_attachment_count:
+            text = "[Attachment unavailable]"
+        if not text:
+            return
+        message_type = _message_type(media_types)
+        timestamp_ms = event.get("timestamp_ms")
+        try:
+            timestamp = datetime.fromtimestamp(
+                int(timestamp_ms) / 1000, tz=timezone.utc
+            )
+        except (TypeError, ValueError, OSError):
+            timestamp = datetime.now(timezone.utc)
+        self._remember(self._last_inbound, chat_id, native_id, 500)
+        message_event = MessageEvent(
+            text=text,
+            user_id=sender,
+            user_name=None,
+            source=self._source_for(event),
+            message_type=message_type,
+            message_id=native_id,
+            timestamp=timestamp,
+            raw_message={
+                "event_kind": "message",
+                "attachment_count": len(media_urls),
+                "declared_attachment_count": declared_attachment_count,
+                "unavailable_attachment_count": unavailable_attachment_count,
+                "has_reply": bool(event.get("reply_to")),
+            },
+            media_urls=media_urls,
+            media_types=media_types,
+            reply_to_message_id=(
+                event.get("reply_to") if isinstance(event.get("reply_to"), str) else None
+            ),
+            metadata={
+                "imessage_group_name": event.get("group_name"),
+                "imessage_received_monotonic_ns": event.get("received_monotonic_ns"),
+            },
+        )
+        await self.handle_message(message_event)
+        try:
+            await self._request(
+                "mark_read", chat_id=chat_id, native_id=native_id
+            )
+        except Exception:
+            LOGGER.warning("iMessage automatic read receipt failed category=transport")
+
+    async def _accept_reaction(self, event: Dict[str, Any]) -> None:
+        await self._forward_platform_event(event)
+        target = event.get("target_id")
+        if not isinstance(target, str) or (
+            target not in self._sent and not bool(event.get("target_from_me"))
+        ):
+            return
+        sender = event.get("sender")
+        chat_id = event.get("chat_id")
+        if not isinstance(sender, str) or not isinstance(chat_id, str):
+            return
+        action = "removed" if event.get("remove") is True else "added"
+        emoji = str(event.get("emoji") or "")
+        await self.handle_message(
+            MessageEvent(
+                text=f"reaction:{action}:{emoji}",
+                user_id=sender,
+                source=self._source_for(event),
+                message_id=str(event.get("native_id") or event.get("event_id")),
+                reply_to_message_id=target,
+                reply_to_is_own_message=True,
+                raw_message={"event_kind": "reaction"},
+            )
+        )
+
+    async def send(
+        self,
+        chat_id: str,
+        content: str,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del metadata, kwargs
+        try:
+            await self.stop_typing(chat_id)
+            result = await self._request(
+                "reply" if reply_to else "send",
+                chat_id=chat_id,
+                text=content,
+                **({"reply_to": reply_to} if reply_to else {}),
+            )
+        except (SidecarUnavailable, SidecarRejected) as exc:
+            return SendResult(success=False, error=_safe_code(exc))
+        native_id = result.get("native_id")
+        if isinstance(native_id, str):
+            self._remember(self._sent, native_id, time.monotonic(), 2000)
+        return SendResult(success=True, message_id=native_id)
+
+    async def _send_file(
+        self,
+        chat_id: str,
+        file_path: str,
+        *,
+        caption: Optional[str],
+        file_name: Optional[str],
+        reply_to: Optional[str],
+    ) -> SendResult:
+        try:
+            await self.stop_typing(chat_id)
+            result = await self._request(
+                "reply_file" if reply_to else "send_file",
+                chat_id=chat_id,
+                path=str(Path(file_path).expanduser()),
+                caption=caption or "",
+                **({"filename": file_name} if file_name else {}),
+                **({"reply_to": reply_to} if reply_to else {}),
+            )
+        except (SidecarUnavailable, SidecarRejected) as exc:
+            return SendResult(success=False, error=_safe_code(exc))
+        native_id = result.get("native_id")
+        if isinstance(native_id, str):
+            self._remember(self._sent, native_id, time.monotonic(), 2000)
+        return SendResult(success=True, message_id=native_id)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: Optional[str] = None,
+        file_name: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del metadata, kwargs
+        return await self._send_file(
+            chat_id, file_path, caption=caption, file_name=file_name, reply_to=reply_to
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del metadata, kwargs
+        return await self._send_file(
+            chat_id, image_path, caption=caption, file_name=None, reply_to=reply_to
+        )
+
+    async def send_video(
+        self,
+        chat_id: str,
+        video_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del metadata, kwargs
+        return await self._send_file(
+            chat_id, video_path, caption=caption, file_name=None, reply_to=reply_to
+        )
+
+    async def send_voice(
+        self,
+        chat_id: str,
+        audio_path: str,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        del metadata, kwargs
+        return await self._send_file(
+            chat_id, audio_path, caption=caption, file_name=None, reply_to=reply_to
+        )
+
+    async def send_typing(
+        self, chat_id: str, metadata: Optional[Dict[str, Any]] = None
+    ) -> None:
+        del metadata
+        try:
+            await self._request("typing", chat_id=chat_id, active=True)
+        except Exception:
+            return
+
+    async def stop_typing(self, chat_id: str) -> None:
+        try:
+            await self._request("typing", chat_id=chat_id, active=False)
+        except Exception:
+            return
+
+    async def mark_read(self, chat_id: str) -> bool:
+        try:
+            await self._request(
+                "mark_read",
+                chat_id=chat_id,
+                native_id=self._last_inbound.get(chat_id),
+            )
+            return True
+        except Exception:
+            return False
+
+    async def add_reaction(
+        self,
+        chat_id: str,
+        reaction: str,
+        message_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        target = message_id or self._last_inbound.get(chat_id)
+        if not target:
+            return {"success": False, "error": "missing_message_id"}
+        try:
+            result = await self._request(
+                "react", chat_id=chat_id, native_id=target, reaction=reaction
+            )
+            return {"success": True, "message_id": result.get("native_id")}
+        except (SidecarUnavailable, SidecarRejected) as exc:
+            return {"success": False, "error": _safe_code(exc)}
+
+    async def remove_reaction(
+        self,
+        chat_id: str,
+        message_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        target = message_id or self._last_inbound.get(chat_id)
+        if not target:
+            return {"success": False, "error": "missing_message_id"}
+        try:
+            result = await self._request(
+                "unreact", chat_id=chat_id, native_id=target
+            )
+            return {"success": True, "message_id": result.get("native_id")}
+        except (SidecarUnavailable, SidecarRejected) as exc:
+            return {"success": False, "error": _safe_code(exc)}
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        del finalize
+        try:
+            result = await self._request(
+                "edit", chat_id=chat_id, native_id=message_id, text=content
+            )
+            return SendResult(success=True, message_id=result.get("native_id"))
+        except (SidecarUnavailable, SidecarRejected) as exc:
+            return SendResult(success=False, error=_safe_code(exc))
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        try:
+            await self._request(
+                "undo_send", chat_id=chat_id, native_id=message_id
+            )
+            return True
+        except Exception:
+            return False
+
+    async def create_conversation(
+        self, participants: list[str], group_name: Optional[str] = None
+    ) -> Dict[str, Any]:
+        return await self._request(
+            "create_conversation", participants=participants, group_name=group_name
+        )
+
+    async def rename_group(self, chat_id: str, name: str) -> Dict[str, Any]:
+        return await self._request("rename_group", chat_id=chat_id, name=name)
+
+    async def change_participants(
+        self, chat_id: str, participants: list[str]
+    ) -> Dict[str, Any]:
+        return await self._request(
+            "change_participants", chat_id=chat_id, participants=participants
+        )
+
+    async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+        return {
+            "id": chat_id,
+            "name": chat_id,
+            "type": "group" if chat_id.startswith("imessage:") else "dm",
+        }
+
+
+def _message_type(mimes: list[str]) -> MessageType:
+    if not mimes:
+        return MessageType.TEXT
+    if all(value.startswith("image/") for value in mimes):
+        return MessageType.PHOTO
+    if all(value.startswith("video/") for value in mimes):
+        return MessageType.VIDEO
+    if all(value.startswith("audio/") for value in mimes):
+        return MessageType.AUDIO
+    return MessageType.DOCUMENT
+
+
+def _safe_code(exc: BaseException) -> str:
+    if isinstance(exc, SidecarRejected):
+        return exc.code
+    if isinstance(exc, SidecarUnavailable):
+        return str(exc)
+    return "transport_error"
+
+
+def _has_network_configuration(value: Any, path: tuple[str, ...] = ()) -> bool:
+    if isinstance(value, dict):
+        for key, child in value.items():
+            lowered = str(key).lower()
+            if any(part in lowered for part in NETWORK_KEY_PARTS):
+                return True
+            if _has_network_configuration(child, path + (lowered,)):
+                return True
+    elif isinstance(value, (list, tuple)):
+        return any(_has_network_configuration(child, path) for child in value)
+    return False
+
+
+def validate_config(config: Dict[str, Any]) -> tuple[bool, str]:
+    extra = config.get("extra", config) if isinstance(config, dict) else {}
+    if not isinstance(extra, dict):
+        return False, "extra must be a mapping"
+    if _has_network_configuration(extra):
+        return False, "network configuration is not supported"
+    raw = str(extra.get("socket_path") or DEFAULT_SOCKET)
+    if not Path(raw).expanduser().is_absolute():
+        return False, "socket_path must be absolute"
+    return True, ""
+
+
+def is_connected(adapter: Any) -> bool:
+    return isinstance(adapter, RustPushIMessageAdapter) and adapter.is_connected
+
+
+def register(ctx) -> None:
+    ctx.register_platform(
+        name=PLATFORM_NAME,
+        label="Local iMessage (RustPush)",
+        adapter_factory=lambda config: RustPushIMessageAdapter(config),
+        check_fn=lambda: sys.platform == "darwin",
+        validate_config=validate_config,
+        required_env=[],
+        install_hint="Install and start the local Hermes RustPush sidecar.",
+        is_connected=is_connected,
+        allowed_users_env="RUSTPUSH_ALLOWED_USERS",
+        allow_all_env="RUSTPUSH_ALLOW_ALL_USERS",
+        max_message_length=RustPushIMessageAdapter.MAX_MESSAGE_LENGTH,
+        allow_update_command=False,
+        pii_safe=True,
+    )

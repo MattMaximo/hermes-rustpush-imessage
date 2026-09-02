@@ -1,0 +1,28 @@
+# Build products and caches
+.build/
+dist/
+target/
+.venv/
+venv/
+__pycache__/
+.pytest_cache/
+.coverage
+htmlcov/
+*.pyc
+*.pyo
+*.dylib
+*.a
+
+# Local state and credentials must never enter source control
+state/
+run/
+*.enc
+*.plist
+.env
+.env.*
+!.env.example
+
+# macOS and editors
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,3 @@
+# Patch payloads preserve upstream source whitespace exactly.
+patches/*.patch whitespace=-blank-at-eol,-space-before-tab
+LICENSES/rustpush-exceptions.txt whitespace=-blank-at-eol
