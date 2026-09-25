@@ -14,6 +14,7 @@ import getpass
 import importlib
 import json
 import os
+import re
 from pathlib import Path
 import stat
 import sys
@@ -114,20 +115,47 @@ def write_status(path: Path, value: dict[str, Any]) -> None:
 
 
 def classify_error(exc: BaseException) -> str:
+    return public_failure(exc)["reason"]
+
+
+def public_failure(exc: BaseException) -> dict[str, str]:
     text = str(exc).lower()
-    if "bad credential" in text or "incorrect" in text or "password" in text:
-        return "bad_credentials"
-    if "2fa" in text or "verification" in text or "code" in text:
-        return "verification_failed"
-    if "rate" in text or "too many" in text or "-22406" in text:
-        return "apple_rate_limited"
-    if "extra step" in text:
-        return "unsupported_extra_step"
-    if "anisette" in text or "aoskit" in text or "-45070" in text:
-        return "anisette_unavailable"
-    if "network" in text or "timeout" in text or "http" in text or "connection" in text:
-        return "network_or_apple_service"
-    return "unknown"
+    ids_status = None
+    match = re.search(r"\((\d{3,5})\)|unknown ids error (\d+)|status (\d+)", text)
+    if match:
+        ids_status = next(group for group in match.groups() if group)
+    if ids_status == "5052":
+        reason = "alias_recently_changed"
+    elif ids_status in {"6001"}:
+        reason = "ids_incompatible"
+    elif ids_status in {"6004", "6005"}:
+        reason = "ids_rejected"
+    elif ids_status == "6009":
+        reason = "imessage_disabled"
+    elif "no pet token" in text:
+        reason = "missing_pet"
+    elif "no ids delegate" in text:
+        reason = "missing_ids_delegate"
+    elif "absinthe error" in text or "nac error" in text:
+        reason = "validation_data"
+    elif "bad credential" in text or "incorrect" in text or "password" in text:
+        reason = "bad_credentials"
+    elif "2fa" in text or "verification" in text or "code" in text:
+        reason = "verification_failed"
+    elif "rate" in text or "too many" in text or "-22406" in text:
+        reason = "apple_rate_limited"
+    elif "extra step" in text:
+        reason = "unsupported_extra_step"
+    elif "anisette" in text or "aoskit" in text or "-45070" in text:
+        reason = "anisette_unavailable"
+    elif "network" in text or "timeout" in text or "http" in text or "connection" in text:
+        reason = "network_or_apple_service"
+    else:
+        reason = "unknown"
+    failure = {"reason": reason}
+    if ids_status:
+        failure["ids_status"] = ids_status
+    return failure
 
 
 def account_bundle(config: Any, result: Any, persist_blob: str | None, mme_delegate: str | None) -> dict[str, Any]:
@@ -271,7 +299,7 @@ async def run_setup(args: argparse.Namespace) -> dict[str, Any]:
             "ok": False,
             "stage": stage,
             "error_class": type(exc).__name__,
-            "reason": classify_error(exc),
+            **public_failure(exc),
         }
         write_status(status_path, failure)
         raise
@@ -300,8 +328,10 @@ def main() -> int:
         print("\nSetup cancelled; no account state was committed.", file=sys.stderr)
         return 130
     except BaseException as exc:
+        detail = public_failure(exc)
+        suffix = f", ids_status {detail['ids_status']}" if "ids_status" in detail else ""
         print(
-            f"Setup stopped safely ({type(exc).__name__}, {classify_error(exc)}). "
+            f"Setup stopped safely ({type(exc).__name__}, {detail['reason']}{suffix}). "
             "No credentials were logged. Keep this window open and tell Hermes the stage shown in setup-status.json.",
             file=sys.stderr,
         )
