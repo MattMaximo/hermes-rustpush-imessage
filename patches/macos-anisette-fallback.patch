@@ -1,0 +1,173 @@
+diff --git a/third_party/apple-private-apis/omnisette/src/aos_kit.rs b/third_party/apple-private-apis/omnisette/src/aos_kit.rs
+index 6b45952..f4d9208 100644
+--- a/third_party/apple-private-apis/omnisette/src/aos_kit.rs
++++ b/third_party/apple-private-apis/omnisette/src/aos_kit.rs
+@@ -24,6 +24,21 @@ impl<'lt> AOSKitAnisetteProvider<'lt> {
+     }
+ }
+ 
++fn required_nsstring(value: *const NSString, label: &str) -> Result<String, AnisetteError> {
++    if value.is_null() {
++        return Err(AnisetteError::Anyhow(anyhow::anyhow!(
++            "AOSKit returned no {label}"
++        )));
++    }
++    let text = unsafe { (*value).as_str() }.trim().to_string();
++    if text.is_empty() {
++        return Err(AnisetteError::Anyhow(anyhow::anyhow!(
++            "AOSKit returned an empty {label}"
++        )));
++    }
++    Ok(text)
++}
++
+ impl<'lt> AnisetteProvider for AOSKitAnisetteProvider<'lt> {
+     async fn get_anisette_headers(
+         &mut self
+@@ -33,19 +48,24 @@ impl<'lt> AnisetteProvider for AOSKitAnisetteProvider<'lt> {
+         let headers: *const NSObject = unsafe {
+             msg_send![self.aos_utilities, retrieveOTPHeadersForDSID: NSString::from_str("-2")]
+         };
++        if headers.is_null() {
++            return Err(AnisetteError::Anyhow(anyhow::anyhow!(
++                "AOSKit returned no OTP headers"
++            )));
++        }
+ 
+         let otp: *const NSString =
+             unsafe { msg_send![headers, valueForKey: NSString::from_str("X-Apple-MD")] };
+         headers_map.insert(
+             "X-Apple-I-MD".to_string(),
+-            unsafe { (*otp).as_str() }.to_string(),
++            required_nsstring(otp, "one-time machine header")?,
+         );
+ 
+         let mid: *const NSString =
+             unsafe { msg_send![headers, valueForKey: NSString::from_str("X-Apple-MD-M")] };
+         headers_map.insert(
+             "X-Apple-I-MD-M".to_string(),
+-            unsafe { (*mid).as_str() }.to_string(),
++            required_nsstring(mid, "machine id")?,
+         );
+ 
+         let machine_serial_number: *const NSString =
+diff --git a/third_party/apple-private-apis/omnisette/src/lib.rs b/third_party/apple-private-apis/omnisette/src/lib.rs
+index 131b7d5..7ce8590 100644
+--- a/third_party/apple-private-apis/omnisette/src/lib.rs
++++ b/third_party/apple-private-apis/omnisette/src/lib.rs
+@@ -119,10 +119,54 @@ async fn test_adi() {
+ }
+ 
+ 
+-#[cfg(target_os = "macos")]
++#[cfg(all(target_os = "macos", feature = "remote-anisette-v3"))]
++pub struct FallbackAnisetteProvider {
++    local: Option<AOSKitAnisetteProvider<'static>>,
++    remote: RemoteAnisetteProviderV3,
++}
++
++#[cfg(all(target_os = "macos", feature = "remote-anisette-v3"))]
++fn aoskit_headers_usable(headers: &HashMap<String, String>) -> bool {
++    ["X-Apple-I-MD", "X-Apple-I-MD-M"]
++        .iter()
++        .all(|key| headers.get(*key).is_some_and(|value| !value.trim().is_empty()))
++}
++
++#[cfg(all(target_os = "macos", feature = "remote-anisette-v3"))]
++impl AnisetteProvider for FallbackAnisetteProvider {
++    async fn get_anisette_headers(
++        &mut self,
++    ) -> Result<HashMap<String, String>, AnisetteError> {
++        if let Some(local) = self.local.as_mut() {
++            match local.get_anisette_headers().await {
++                Ok(headers) if aoskit_headers_usable(&headers) => return Ok(headers),
++                Ok(_) => log::warn!("AOSKit anisette headers were incomplete; using the provisioned fallback"),
++                Err(_) => log::warn!("AOSKit anisette headers were unavailable; using the provisioned fallback"),
++            }
++        }
++        match self.remote.get_anisette_headers().await {
++            Ok(headers) => Ok(headers),
++            Err(_) => self.remote.get_anisette_headers().await,
++        }
++    }
++}
++
++#[cfg(all(target_os = "macos", feature = "remote-anisette-v3"))]
++pub type DefaultAnisetteProvider = FallbackAnisetteProvider;
++#[cfg(all(target_os = "macos", feature = "remote-anisette-v3"))]
++pub fn default_provider(info: LoginClientInfo, path: PathBuf) -> ArcAnisetteClient<DefaultAnisetteProvider> {
++    Arc::new(Mutex::new(AnisetteClient::new(FallbackAnisetteProvider {
++        local: AOSKitAnisetteProvider::new().ok(),
++        remote: RemoteAnisetteProviderV3::new(
++            DEFAULT_ANISETTE_URL_V3.to_string(),
++            info,
++            path,
++        ),
++    })))
++}
++
++#[cfg(all(target_os = "macos", not(feature = "remote-anisette-v3")))]
+ pub type DefaultAnisetteProvider = AOSKitAnisetteProvider<'static>;
+-#[cfg(target_os = "macos")]
++#[cfg(all(target_os = "macos", not(feature = "remote-anisette-v3")))]
+ pub fn default_provider(info: LoginClientInfo, path: PathBuf) -> ArcAnisetteClient<DefaultAnisetteProvider> {
++    let _ = (info, path);
+     Arc::new(Mutex::new(AnisetteClient::new(AOSKitAnisetteProvider::new().expect("Failed to load anisette provider?"))))
+ }
+ 
+diff --git a/third_party/apple-private-apis/omnisette/src/remote_anisette_v3.rs b/third_party/apple-private-apis/omnisette/src/remote_anisette_v3.rs
+index 58cb1fb..ea4d525 100644
+--- a/third_party/apple-private-apis/omnisette/src/remote_anisette_v3.rs
++++ b/third_party/apple-private-apis/omnisette/src/remote_anisette_v3.rs
+@@ -237,7 +237,9 @@ impl AnisetteClient {
+                 if message.contains("-45061") {
+                     Err(AnisetteError::AnisetteNotProvisioned)
+                 } else {
+-                    panic!("Unknown error {}", message)
++                    Err(AnisetteError::Anyhow(anyhow::anyhow!(
++                        "anisette header service rejected the request"
++                    )))
+                 }
+             },
+             AnisetteHeaders::Headers { machine_id, one_time_password, routing_info } => {
+@@ -287,8 +289,15 @@ impl AnisetteClient {
+         }
+ 
+         loop {
+-            let Some(Ok(data)) = connection.next().await else {
+-                continue
++            let next = tokio::time::timeout(std::time::Duration::from_secs(20), connection.next())
++                .await
++                .map_err(|_| AnisetteError::Anyhow(anyhow::anyhow!(
++                    "anisette identity request timed out"
++                )))?;
++            let Some(Ok(data)) = next else {
++                return Err(AnisetteError::Anyhow(anyhow::anyhow!(
++                    "anisette identity connection closed"
++                )));
+             };
+             if data.is_text() {
+                 let txt = data.to_text().unwrap();
+@@ -367,6 +376,11 @@ impl AnisetteClient {
+             }
+         }
+ 
++        if state.adi_pb.is_none() {
++            return Err(AnisetteError::Anyhow(anyhow::anyhow!(
++                "anisette identity connection closed"
++            )));
++        }
+         Ok(())
+     }
+ }
+@@ -416,7 +430,9 @@ impl AnisetteProvider for RemoteAnisetteProviderV3 {
+                     client.provision(state).await?;
+                     plist::to_file_xml(config_path, state)?;
+                     client.get_headers(&state).await?
+-                } else { panic!() }
++                } else {
++                    return Err(err);
++                }
+             },
+         };
+         Ok(data.get_headers())

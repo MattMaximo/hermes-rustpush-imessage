@@ -19,6 +19,7 @@ DIST = ROOT / "dist" / "bindings"
 PINS = ROOT / "pins.env"
 CORTEN_PATCH = ROOT / "patches" / "corten-local.patch"
 RUSTPUSH_SECURE_STATE_PATCH = ROOT / "patches" / "rustpush-secure-state.patch"
+MACOS_ANISETTE_PATCH = ROOT / "patches" / "macos-anisette-fallback.patch"
 PRIVACY_PATCHER = ROOT / "scripts" / "apply_privacy_patches.py"
 
 
@@ -143,6 +144,7 @@ def main() -> int:
     if actual_rustpush != pins["RUSTPUSH_COMMIT"]:
         raise RuntimeError(f"RustPush pin mismatch: {actual_rustpush}")
     apply_patch(rustpush, RUSTPUSH_SECURE_STATE_PATCH)
+    apply_patch(rustpush, MACOS_ANISETTE_PATCH)
     run([sys.executable, str(PRIVACY_PATCHER), str(rustpush)], env=env)
     rustpushgo_dir = source / "pkg" / "rustpushgo"
     build_env = env | {"MACOSX_DEPLOYMENT_TARGET": "12.0"}
@@ -154,7 +156,7 @@ def main() -> int:
             "--locked",
             "--no-default-features",
             "--features",
-            "nac-apple-framework",
+            "nac-apple-framework,anisette-remote-v3",
         ],
         cwd=rustpushgo_dir,
         env=build_env,

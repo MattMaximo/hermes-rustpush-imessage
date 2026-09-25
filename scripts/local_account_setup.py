@@ -123,7 +123,9 @@ def classify_error(exc: BaseException) -> str:
         return "apple_rate_limited"
     if "extra step" in text:
         return "unsupported_extra_step"
-    if "network" in text or "timeout" in text or "http" in text:
+    if "anisette" in text or "aoskit" in text or "-45070" in text:
+        return "anisette_unavailable"
+    if "network" in text or "timeout" in text or "http" in text or "connection" in text:
         return "network_or_apple_service"
     return "unknown"
 
