@@ -13,6 +13,11 @@ messages through a third-party relay.
 > **Contact Key Verification:** this client currently requires Apple Contact
 > Key Verification to be disabled. That is a real security trade-off. The
 > setup does not disable it for you.
+>
+> **macOS sign-in fallback:** when native AOSKit headers are unavailable, sign-in
+> uses a third-party anisette-v3 metadata service and a separate local
+> provisioning cache. Review [Compatibility and replay fixes](#compatibility-and-replay-fixes)
+> before signing in; messages themselves are not relayed through that service.
 
 ## Architecture
 
@@ -91,7 +96,8 @@ python3 scripts/standalone_preflight.py \
 
 Sign in interactively. The script reads the Apple ID, password, and any 2FA
 challenge directly from the controlling TTY, zeroes mutable buffers where
-possible, and persists only encrypted state:
+possible, and encrypts account and transport state. The macOS compatibility
+fallback also uses a separate anisette provisioning cache as described below:
 
 ```bash
 python3 scripts/local_account_setup.py \
@@ -141,6 +147,33 @@ pairing code, approve it explicitly:
 ```bash
 hermes pairing approve imessage_cli CODE
 ```
+
+## Compatibility and replay fixes
+
+- On macOS 27, empty or unavailable AOSKit authentication headers fall back to
+  the pinned software-signin/anisette-v3 path. Valid native headers remain the
+  preferred path. Setup reports only a fixed failure category and numeric IDS
+  status code, never the raw registration exception.
+- Concurrent event replays are claimed before gateway admission. Native-message
+  identity is deduplicated independently of transport event IDs; distinct native
+  messages with identical text remain distinct. Active claims are not evicted
+  by completed-cache churn, and admission is retained across receipt/ack failure.
+- Outgoing message echoes are acknowledged without another agent turn. A
+  self-chat reply retains a single own-handle recipient; peer replies still
+  exclude the account's own handles.
+
+Deduplication is bounded and in-memory: it is not an exactly-once guarantee
+across adapter replacement or completed-cache eviction.
+
+The macOS fallback uses SideStore's anisette-v3 service at
+`https://ani.sidestore.io` for provisioning and authentication headers. That
+exchanges an anisette identifier, provisioning material and header-generation
+requests with that third party; iMessage content is not relayed through it, and
+this provider does not receive the Apple ID, password or 2FA code. Its separate
+`rustpush-anisette` cache under the user's platform data directory is not part
+of the Keychain-encrypted account-state envelope. Review that dependency and
+local cache before signing in; this is not an entirely offline authentication
+path.
 
 ## Security model
 

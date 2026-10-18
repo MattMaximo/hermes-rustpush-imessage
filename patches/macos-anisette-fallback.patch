@@ -55,7 +55,7 @@ diff --git a/third_party/apple-private-apis/omnisette/src/lib.rs b/third_party/a
 index 131b7d5..7ce8590 100644
 --- a/third_party/apple-private-apis/omnisette/src/lib.rs
 +++ b/third_party/apple-private-apis/omnisette/src/lib.rs
-@@ -119,10 +119,54 @@ async fn test_adi() {
+@@ -119,10 +119,57 @@ async fn test_adi() {
  }
  
  

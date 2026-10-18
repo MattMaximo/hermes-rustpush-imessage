@@ -15,7 +15,7 @@ if str(SIDECAR) not in sys.path:
     sys.path.insert(0, str(SIDECAR))
 
 from core import ENVELOPE_MAGIC, PROTOCOL_VERSION, conversation_id, normalize_identifier  # noqa: E402
-from runtime import RustPushRuntime, _reply_target, _transport_error  # noqa: E402
+from runtime import CommandError, RustPushRuntime, _reply_target, _transport_error  # noqa: E402
 from server import LocalProtocolServer  # noqa: E402
 
 
@@ -136,6 +136,135 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_reply_target("MESSAGE-UUID", None), ("MESSAGE-UUID", "0:0:0"))
         self.assertEqual(_reply_target("MESSAGE-UUID_att0", None), ("MESSAGE-UUID", "1:0:0"))
         self.assertEqual(_reply_target("MESSAGE-UUID_att2", "9:0:4"), ("MESSAGE-UUID", "9:0:4"))
+
+    async def test_native_self_chat_registration_supports_opaque_reply(self):
+        chat_id, _ = await self.runtime._register_message_conversation(SimpleNamespace(
+            sender="mailto:owner@example.com",
+            participants=[" MAILTO:Owner@Example.COM "],
+        ))
+        self.assertRegex(chat_id, r"^imessage:[0-9a-f]{32}$")
+        result = await self.runtime.dispatch({
+            "op": "reply", "chat_id": chat_id,
+            "text": "synthetic native self-chat reply", "reply_to": "self-message",
+        })
+        self.assertEqual(result["chat_id"], chat_id)
+        self.assertEqual(result["native_id"], "out-message")
+        name, args = self.runtime.client.calls[-1]
+        self.assertEqual(name, "send_message")
+        self.assertEqual(args[0].participants, ["mailto:owner@example.com"])
+        self.assertEqual(args[4:6], ("self-message", "0:0:0"))
+        self.assertEqual(self.runtime.transport["conversations"][chat_id]["participants"],
+                         ["mailto:owner@example.com"])
+
+    async def test_native_self_chat_with_missing_participants_uses_own_sender(self):
+        for fields in ({}, {"participants": None}, {"participants": []}):
+            with self.subTest(fields=fields):
+                chat_id, record = await self.runtime._register_message_conversation(
+                    SimpleNamespace(sender="Owner@Example.COM", **fields)
+                )
+                await self.runtime.dispatch({
+                    "op": "reply", "chat_id": chat_id, "text": "synthetic reply",
+                    "reply_to": "self-message",
+                })
+                self.assertEqual(record["participants"], ["mailto:owner@example.com"])
+                self.assertEqual(self.runtime.client.calls[-1][1][0].participants,
+                                 ["mailto:owner@example.com"])
+
+    async def test_native_self_chat_preserves_only_one_normalized_own_recipient(self):
+        self.runtime.own_handles.append("mailto:other-self@example.com")
+        chat_id, record = await self.runtime._register_message_conversation(SimpleNamespace(
+            sender="mailto:owner@example.com",
+            participants=[" MAILTO:Other-Self@Example.COM ", "mailto:owner@example.com"],
+        ))
+        await self.runtime.dispatch({
+            "op": "reply", "chat_id": chat_id, "text": "synthetic reply", "reply_to": "self-message",
+        })
+        self.assertEqual(record["participants"], ["mailto:other-self@example.com"])
+        self.assertEqual(self.runtime.client.calls[-1][1][0].participants, record["participants"])
+
+    async def test_native_mixed_group_registration_keeps_peers_and_identity(self):
+        message = SimpleNamespace(
+            sender="mailto:owner@example.com",
+            participants=["mailto:owner@example.com", "Peer@Example.COM", "mailto:second@example.com"],
+            sender_guid="synthetic-group-guid", group_name="Old name",
+        )
+        chat_id, record = await self.runtime._register_message_conversation(message)
+        message.group_name = "New name"
+        renamed_id, _ = await self.runtime._register_message_conversation(message)
+        self.assertEqual(renamed_id, chat_id)
+        await self.runtime.dispatch({
+            "op": "reply", "chat_id": chat_id, "text": "synthetic group reply", "reply_to": "peer-message",
+        })
+        expected = ["mailto:peer@example.com", "mailto:second@example.com"]
+        self.assertEqual(record["participants"], expected)
+        conversation = self.runtime.client.calls[-1][1][0]
+        self.assertEqual(conversation.participants, expected)
+        self.assertEqual(conversation.sender_guid, message.sender_guid)
+        self.assertEqual(conversation.group_name, "New name")
+
+    async def test_empty_or_invalid_native_and_legacy_records_do_not_infer_own_target(self):
+        for participants in ([], [None, "invalid-target"]):
+            with self.subTest(participants=participants):
+                chat_id, record = await self.runtime._register_message_conversation(
+                    SimpleNamespace(sender=None, participants=participants)
+                )
+                self.assertEqual(record["participants"], [])
+                # Also exercise an existing record without native own-handle evidence.
+                self.runtime.transport["conversations"][chat_id]["participants"] = participants
+                with self.assertRaisesRegex(CommandError, "^unknown_conversation$"):
+                    await self.runtime.dispatch({
+                        "op": "reply", "chat_id": chat_id, "text": "must not send", "reply_to": "source",
+                    })
+        self.assertEqual(self.runtime.client.calls, [])
+
+    async def test_native_self_chat_sms_still_rejected(self):
+        message = SimpleNamespace(sender="mailto:owner@example.com",
+                                  participants=["mailto:owner@example.com"], is_sms=True)
+        await self.runtime._process_message(message)
+        self.assertEqual(self.events, [])
+        self.assertEqual(self.runtime.transport["conversations"], {})
+        chat_id, _ = await self.runtime._register_message_conversation(message)
+        with self.assertRaisesRegex(CommandError, "^sms_not_supported$"):
+            await self.runtime.dispatch({
+                "op": "reply", "chat_id": chat_id, "text": "must not send", "reply_to": "source",
+            })
+        self.assertEqual(self.runtime.client.calls, [])
+
+    async def test_self_chat_reply_preserves_own_recipient(self):
+        result = await self.runtime.dispatch({
+            "op": "reply", "chat_id": "mailto:owner@example.com",
+            "text": "synthetic self-chat reply", "reply_to": "self-message",
+        })
+        self.assertEqual(result["native_id"], "out-message")
+        name, args = self.runtime.client.calls[-1]
+        self.assertEqual(name, "send_message")
+        self.assertEqual(args[0].participants, ["mailto:owner@example.com"])
+        self.assertEqual(args[4], "self-message")
+
+    async def test_existing_self_chat_uses_only_one_own_handle(self):
+        created = await self.runtime.dispatch({
+            "op": "create_conversation", "participants": ["mailto:peer@example.com"],
+        })
+        self.runtime.own_handles = ["mailto:owner@example.com", "mailto:other-self@example.com"]
+        self.runtime.transport["conversations"][created["chat_id"]]["participants"] = list(self.runtime.own_handles)
+        await self.runtime.dispatch({
+            "op": "send", "chat_id": created["chat_id"], "text": "synthetic self-chat send",
+        })
+        conversation = self.runtime.client.calls[-1][1][0]
+        self.assertEqual(len(conversation.participants), 1)
+        self.assertIn(conversation.participants[0], self.runtime.own_handles)
+
+    async def test_peer_reply_still_excludes_own_handle(self):
+        created = await self.runtime.dispatch({
+            "op": "create_conversation", "participants": ["mailto:peer@example.com"],
+        })
+        self.runtime.transport["conversations"][created["chat_id"]]["participants"] = [
+            "mailto:owner@example.com", "mailto:peer@example.com",
+        ]
+        await self.runtime.dispatch({
+            "op": "send", "chat_id": created["chat_id"], "text": "synthetic peer send",
+        })
+        self.assertEqual(self.runtime.client.calls[-1][1][0].participants, ["mailto:peer@example.com"])
 
     async def test_all_outbound_operations_map_thinly_to_client(self):
         created = await self.runtime.dispatch(
@@ -261,6 +390,23 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.events[0]["kind"], "typing")
         self.assertTrue(self.events[0]["ephemeral"])
         self.assertEqual(self.runtime.transport["events"], [])
+
+    async def test_outgoing_text_to_someone_else_is_not_a_hermes_request(self):
+        self.runtime.own_handles = ["mailto:owner@example.com", "tel:+15555550100"]
+        message = SimpleNamespace(
+            uuid="to-friend",
+            sender="tel:+15555550100",
+            participants=["tel:+15555550100", "tel:+15555550999"],
+            group_name=None,
+            timestamp_ms=123,
+            is_sms=False,
+            text="game",
+            sender_guid="thread-friend",
+        )
+        await self.runtime._process_message(message)
+        self.assertTrue(self.events[0]["from_me"])
+        self.assertNotIn("tel:+15555550100", self.events[0]["participants"])
+        self.assertIn("tel:+15555550999", self.events[0]["participants"])
 
 
 class FakeRuntime:

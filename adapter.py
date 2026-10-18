@@ -257,6 +257,8 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
         self._last_inbound: OrderedDict[str, str] = OrderedDict()
         self._sent: OrderedDict[str, float] = OrderedDict()
         self._processed_events: OrderedDict[str, float] = OrderedDict()
+        self._processed_messages: OrderedDict[tuple[str, str], float] = OrderedDict()
+        self._inflight_events: dict[tuple[str, ...], asyncio.Future] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # The gateway supplies this keyword on both cold-start and recovery
@@ -331,7 +333,7 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
         return await client.request(op, **payload)
 
     def _remember(
-        self, mapping: OrderedDict[str, Any], key: str, value: Any, limit: int
+        self, mapping: OrderedDict[Any, Any], key: Any, value: Any, limit: int
     ) -> None:
         mapping[key] = value
         mapping.move_to_end(key)
@@ -342,26 +344,79 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
         event_id = event.get("event_id")
         if not isinstance(event_id, str) or not event_id:
             return
-        if event_id in self._processed_events:
-            await self._request("ack", event_id=event_id)
-            return
         kind = event.get("kind")
         if kind == "typing":
             await self._forward_platform_event(event)
             return
-        if event.get("from_me") is True:
-            native_id = event.get("native_id")
-            if isinstance(native_id, str) and native_id:
-                self._remember(self._sent, native_id, time.monotonic(), 2000)
-            await self._ack_processed(event_id)
-            return
-        if kind == "message":
-            await self._accept_message(event)
-        elif kind == "reaction":
-            await self._accept_reaction(event)
-        else:
-            await self._forward_platform_event(event)
-        await self._ack_processed(event_id)
+        message_key = None
+        if kind == "message" and event.get("from_me") is not True:
+            chat_id, native_id = event.get("chat_id"), event.get("native_id")
+            if (
+                isinstance(chat_id, str) and chat_id
+                and isinstance(native_id, str) and native_id
+                and isinstance(event.get("sender"), str) and event["sender"]
+            ):
+                message_key = (chat_id, native_id)
+        keys: list[tuple[str, ...]] = [("event", event_id)]
+        if message_key is not None:
+            keys.append(("message", *message_key))
+        while True:
+            if event_id in self._processed_events or (
+                message_key is not None and message_key in self._processed_messages
+            ):
+                await self._ack_processed(event_id)
+                return
+            pending = next((self._inflight_events[key] for key in keys if key in self._inflight_events), None)
+            if pending is None:
+                break
+            # Do not ack until admission succeeds; a cancelled waiter must not
+            # cancel the owner's claim. Failed owners leave replay retryable.
+            if await asyncio.shield(pending):
+                await self._ack_processed(event_id)
+                return
+
+        # No await between checking and claiming either identity: reader tasks
+        # share one event loop. In-flight claims are never retention-evicted.
+        claim = asyncio.get_running_loop().create_future()
+        for key in keys:
+            self._inflight_events[key] = claim
+        completed = False
+        accepted_message = False
+
+        def remember_completed() -> None:
+            nonlocal completed
+            if completed:
+                return
+            if message_key is not None:
+                self._remember(self._processed_messages, message_key, time.monotonic(), 4096)
+            self._remember(self._processed_events, event_id, time.monotonic(), 4096)
+            completed = True
+
+        try:
+            if event.get("from_me") is True:
+                native_id = event.get("native_id")
+                if isinstance(native_id, str) and native_id:
+                    self._remember(self._sent, native_id, time.monotonic(), 2000)
+            elif kind == "message":
+                accepted_message = await self._accept_message(event, on_admitted=remember_completed)
+            elif kind == "reaction":
+                await self._accept_reaction(event)
+            else:
+                await self._forward_platform_event(event)
+            remember_completed()
+        finally:
+            for key in keys:
+                del self._inflight_events[key]
+            claim.set_result(completed)
+        # Transport failure/cancellation after admission must not roll it back.
+        if accepted_message:
+            try:
+                await self._request(
+                    "mark_read", chat_id=event["chat_id"], native_id=event["native_id"]
+                )
+            except Exception:
+                LOGGER.warning("iMessage automatic read receipt failed category=transport")
+        await self._request("ack", event_id=event_id)
 
     async def _ack_processed(self, event_id: str) -> None:
         self._remember(self._processed_events, event_id, time.monotonic(), 4096)
@@ -407,12 +462,14 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
         }
         await handler(stable, self._source_for(event))
 
-    async def _accept_message(self, event: Dict[str, Any]) -> None:
+    async def _accept_message(
+        self, event: Dict[str, Any], *, on_admitted: Callable[[], None] | None = None
+    ) -> bool:
         chat_id = event.get("chat_id")
         native_id = event.get("native_id")
         sender = event.get("sender")
         if not all(isinstance(value, str) and value for value in (chat_id, native_id, sender)):
-            return
+            return False
         media_urls: list[str] = []
         media_types: list[str] = []
         attachment_meta = event.get("attachments")
@@ -473,7 +530,7 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
         elif not text and declared_attachment_count:
             text = "[Attachment unavailable]"
         if not text:
-            return
+            return False
         message_type = _message_type(media_types)
         timestamp_ms = event.get("timestamp_ms")
         try:
@@ -508,13 +565,14 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
                 "imessage_received_monotonic_ns": event.get("received_monotonic_ns"),
             },
         )
-        await self.handle_message(message_event)
         try:
-            await self._request(
-                "mark_read", chat_id=chat_id, native_id=native_id
-            )
-        except Exception:
-            LOGGER.warning("iMessage automatic read receipt failed category=transport")
+            await self.handle_message(message_event)
+        finally:
+            # Newer Hermes records admission before later awaits. Preserve it
+            # even if cancellation prevents handle_message from returning.
+            if on_admitted is not None and getattr(message_event, "_gateway_accepted", False) is True:
+                on_admitted()
+        return True
 
     async def _accept_reaction(self, event: Dict[str, Any]) -> None:
         await self._forward_platform_event(event)
