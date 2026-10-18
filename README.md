@@ -5,6 +5,10 @@ A thin, local-only Hermes platform plugin for iMessage using
 control Messages.app, use Accessibility automation, disable SIP, or route
 messages through a third-party relay.
 
+This fork includes the macOS 27 sign-in, replay/echo, self-chat, and clean-build
+fixes on `main`. Use the direct installation command below; the catalog package
+may still reference an older revision.
+
 > **Experimental/private-protocol warning:** RustPush uses Apple's private
 > iMessage protocols. Apple can change or restrict them at any time. Signing in
 > may generate Apple account/device notifications. Use a dedicated Mac and an
@@ -75,7 +79,7 @@ Install the plugin disabled first so Hermes does not connect before the local
 runtime is ready:
 
 ```bash
-hermes plugins install boobutler/hermes-rustpush-imessage --no-enable
+hermes plugins install MattMaximo/hermes-rustpush-imessage --no-enable
 cd ~/.hermes/plugins/imessage_cli-platform
 ```
 
