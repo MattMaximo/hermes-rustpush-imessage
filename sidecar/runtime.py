@@ -475,9 +475,16 @@ class RustPushRuntime:
 
     async def _register_message_conversation(self, msg: Any) -> tuple[str, Dict[str, Any]]:
         sender = getattr(msg, "sender", None)
-        participants = normalize_participants(getattr(msg, "participants", []) or [], self.own_handles)
+        raw_participants = getattr(msg, "participants", []) or []
+        participants = normalize_participants(raw_participants, self.own_handles)
         if sender and not self._is_own_handle(sender):
             participants = normalize_participants([*participants, sender], self.own_handles)
+        if not participants:
+            # Keep only an observed own recipient when this is a self-chat.
+            participants = [
+                item for item in normalize_participants([*raw_participants, sender] if sender else raw_participants)
+                if self._is_own_handle(item)
+            ][:1]
         sender_guid = getattr(msg, "sender_guid", None)
         group_name = getattr(msg, "group_name", None)
         is_sms = bool(getattr(msg, "is_sms", False))
@@ -565,11 +572,12 @@ class RustPushRuntime:
         chat_id, conversation = await self._register_message_conversation(msg)
         event_id = uuid.uuid4().hex
         sender = getattr(msg, "sender", None)
+        native_id = str(getattr(msg, "uuid", "") or "")
         event: Dict[str, Any] = {
             "event_id": event_id,
             "kind": kind,
             "chat_id": chat_id,
-            "native_id": str(getattr(msg, "uuid", "") or ""),
+            "native_id": native_id,
             "sender": sender,
             "participants": conversation["participants"],
             "group_name": conversation.get("group_name"),
@@ -674,7 +682,13 @@ class RustPushRuntime:
     def _wrapped_conversation(self, record: Dict[str, Any]) -> Any:
         if bool(record.get("is_sms")):
             raise CommandError("sms_not_supported")
-        participants = normalize_participants(record.get("participants") or [], self.own_handles)
+        raw = normalize_participants(record.get("participants") or [])
+        own = {handle.lower() for handle in self.own_handles}
+        participants = [item for item in raw if item.lower() not in own]
+        if not participants:
+            # A self-chat's only participants are our own handles. Keep one so
+            # the reply fans out to the other devices on this account.
+            participants = [item for item in raw if item.lower() in own][:1]
         if not participants:
             raise CommandError("unknown_conversation")
         return self.binding.WrappedConversation(

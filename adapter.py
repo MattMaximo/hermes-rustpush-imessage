@@ -257,6 +257,21 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
         self._last_inbound: OrderedDict[str, str] = OrderedDict()
         self._sent: OrderedDict[str, float] = OrderedDict()
         self._processed_events: OrderedDict[str, float] = OrderedDict()
+        self._processed_messages: OrderedDict[tuple[str, str], float] = OrderedDict()
+        self._inflight_events: dict[tuple[str, ...], asyncio.Future] = {}
+        # Inbound burst coalescing: iMessage delivers a photo and its caption
+        # (or several quick texts) as separate events. Without a short quiet
+        # period the first event starts a turn and the next one interrupts it.
+        # The base window is short (photo + caption land within ~1s); it only
+        # stretches while the sender's typing indicator says more is coming.
+        self._burst_quiet_s = _bounded_float(extra.get("burst_quiet_seconds"), 1.0, 0.0, 15.0)
+        self._burst_max_s = max(
+            self._burst_quiet_s,
+            _bounded_float(extra.get("burst_max_seconds"), 30.0, 0.0, 120.0),
+        )
+        self._typing_grace_s = _bounded_float(extra.get("typing_grace_seconds"), 15.0, 0.0, 60.0)
+        self._bursts: dict[tuple[str, str], _InboundBurst] = {}
+        self._typing_until: dict[tuple[str, str], float] = {}
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
         # The gateway supplies this keyword on both cold-start and recovery
@@ -331,7 +346,7 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
         return await client.request(op, **payload)
 
     def _remember(
-        self, mapping: OrderedDict[str, Any], key: str, value: Any, limit: int
+        self, mapping: OrderedDict[Any, Any], key: Any, value: Any, limit: int
     ) -> None:
         mapping[key] = value
         mapping.move_to_end(key)
@@ -342,26 +357,80 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
         event_id = event.get("event_id")
         if not isinstance(event_id, str) or not event_id:
             return
-        if event_id in self._processed_events:
-            await self._request("ack", event_id=event_id)
-            return
         kind = event.get("kind")
         if kind == "typing":
+            self._note_typing(event, active=True)
             await self._forward_platform_event(event)
             return
-        if event.get("from_me") is True:
-            native_id = event.get("native_id")
-            if isinstance(native_id, str) and native_id:
-                self._remember(self._sent, native_id, time.monotonic(), 2000)
-            await self._ack_processed(event_id)
-            return
-        if kind == "message":
-            await self._accept_message(event)
-        elif kind == "reaction":
-            await self._accept_reaction(event)
-        else:
-            await self._forward_platform_event(event)
-        await self._ack_processed(event_id)
+        message_key = None
+        if kind == "message" and event.get("from_me") is not True:
+            chat_id, native_id = event.get("chat_id"), event.get("native_id")
+            if (
+                isinstance(chat_id, str) and chat_id
+                and isinstance(native_id, str) and native_id
+                and isinstance(event.get("sender"), str) and event["sender"]
+            ):
+                message_key = (chat_id, native_id)
+        keys: list[tuple[str, ...]] = [("event", event_id)]
+        if message_key is not None:
+            keys.append(("message", *message_key))
+        while True:
+            if event_id in self._processed_events or (
+                message_key is not None and message_key in self._processed_messages
+            ):
+                await self._ack_processed(event_id)
+                return
+            pending = next((self._inflight_events[key] for key in keys if key in self._inflight_events), None)
+            if pending is None:
+                break
+            # Do not ack until admission succeeds; a cancelled waiter must not
+            # cancel the owner's claim. Failed owners leave replay retryable.
+            if await asyncio.shield(pending):
+                await self._ack_processed(event_id)
+                return
+
+        # No await between checking and claiming either identity: reader tasks
+        # share one event loop. In-flight claims are never retention-evicted.
+        claim = asyncio.get_running_loop().create_future()
+        for key in keys:
+            self._inflight_events[key] = claim
+        completed = False
+        accepted_message = False
+
+        def remember_completed() -> None:
+            nonlocal completed
+            if completed:
+                return
+            if message_key is not None:
+                self._remember(self._processed_messages, message_key, time.monotonic(), 4096)
+            self._remember(self._processed_events, event_id, time.monotonic(), 4096)
+            completed = True
+
+        try:
+            if event.get("from_me") is True:
+                native_id = event.get("native_id")
+                if isinstance(native_id, str) and native_id:
+                    self._remember(self._sent, native_id, time.monotonic(), 2000)
+            elif kind == "message":
+                accepted_message = await self._accept_message(event, on_admitted=remember_completed)
+            elif kind == "reaction":
+                await self._accept_reaction(event)
+            else:
+                await self._forward_platform_event(event)
+            remember_completed()
+        finally:
+            for key in keys:
+                del self._inflight_events[key]
+            claim.set_result(completed)
+        # Transport failure/cancellation after admission must not roll it back.
+        if accepted_message:
+            try:
+                await self._request(
+                    "mark_read", chat_id=event["chat_id"], native_id=event["native_id"]
+                )
+            except Exception:
+                LOGGER.warning("iMessage automatic read receipt failed category=transport")
+        await self._request("ack", event_id=event_id)
 
     async def _ack_processed(self, event_id: str) -> None:
         self._remember(self._processed_events, event_id, time.monotonic(), 4096)
@@ -407,12 +476,14 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
         }
         await handler(stable, self._source_for(event))
 
-    async def _accept_message(self, event: Dict[str, Any]) -> None:
+    async def _accept_message(
+        self, event: Dict[str, Any], *, on_admitted: Callable[[], None] | None = None
+    ) -> bool:
         chat_id = event.get("chat_id")
         native_id = event.get("native_id")
         sender = event.get("sender")
         if not all(isinstance(value, str) and value for value in (chat_id, native_id, sender)):
-            return
+            return False
         media_urls: list[str] = []
         media_types: list[str] = []
         attachment_meta = event.get("attachments")
@@ -449,8 +520,15 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
                         mime_type=str(item.get("mime") or "application/octet-stream"),
                     )
                     if cached is not None:
+                        # Hermes' CachedMedia exposes ``media_type``; older
+                        # builds used ``mime_type``. Reading the wrong one
+                        # raised after the path was appended, so photos lost
+                        # their type and reached the agent as documents.
+                        cached_type = getattr(cached, "media_type", None) or getattr(
+                            cached, "mime_type", None
+                        ) or str(item.get("mime") or "application/octet-stream")
                         media_urls.append(cached.path)
-                        media_types.append(cached.mime_type)
+                        media_types.append(cached_type)
                     else:
                         unavailable_attachment_count += 1
                 except Exception:
@@ -473,7 +551,10 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
         elif not text and declared_attachment_count:
             text = "[Attachment unavailable]"
         if not text:
-            return
+            # RustPush surfaces "stopped typing" (Typing(false)) as an empty
+            # message event: release any burst that was waiting on it.
+            self._note_typing(event, active=False)
+            return False
         message_type = _message_type(media_types)
         timestamp_ms = event.get("timestamp_ms")
         try:
@@ -491,30 +572,95 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
             message_type=message_type,
             message_id=native_id,
             timestamp=timestamp,
+            # Adapter diagnostics stay in raw_message: Hermes native admission
+            # refuses any MessageEvent.metadata key outside its closed contract
+            # (``invalid_params (metadata)``), which dropped every inbound text.
             raw_message={
                 "event_kind": "message",
                 "attachment_count": len(media_urls),
                 "declared_attachment_count": declared_attachment_count,
                 "unavailable_attachment_count": unavailable_attachment_count,
                 "has_reply": bool(event.get("reply_to")),
+                "group_name": event.get("group_name"),
+                "received_monotonic_ns": event.get("received_monotonic_ns"),
             },
             media_urls=media_urls,
             media_types=media_types,
             reply_to_message_id=(
                 event.get("reply_to") if isinstance(event.get("reply_to"), str) else None
             ),
-            metadata={
-                "imessage_group_name": event.get("group_name"),
-                "imessage_received_monotonic_ns": event.get("received_monotonic_ns"),
-            },
         )
-        await self.handle_message(message_event)
         try:
-            await self._request(
-                "mark_read", chat_id=chat_id, native_id=native_id
-            )
-        except Exception:
-            LOGGER.warning("iMessage automatic read receipt failed category=transport")
+            await self._dispatch_inbound(message_event)
+        finally:
+            # Newer Hermes records admission before later awaits. Preserve it
+            # even if cancellation prevents handle_message from returning.
+            if on_admitted is not None and getattr(message_event, "_gateway_accepted", False) is True:
+                on_admitted()
+        return True
+
+    def _note_typing(self, event: Dict[str, Any], *, active: bool) -> None:
+        """Track the sender's typing indicator so a pending burst waits for them."""
+        if event.get("from_me") is True:
+            return
+        chat_id, sender = event.get("chat_id"), event.get("sender")
+        if not isinstance(chat_id, str) or not isinstance(sender, str):
+            return
+        key = (chat_id, sender)
+        if active and self._typing_grace_s > 0:
+            self._typing_until[key] = time.monotonic() + self._typing_grace_s
+        else:
+            self._typing_until.pop(key, None)
+        burst = self._bursts.get(key)
+        if burst is not None:
+            burst.wake()
+
+    async def _dispatch_inbound(self, message_event: MessageEvent) -> None:
+        """Hand an inbound message to the gateway, coalescing quick bursts.
+
+        Events from the same sender in the same chat that arrive within
+        ``burst_quiet_seconds`` of each other (capped at ``burst_max_seconds``
+        from the first) become ONE gateway message: texts are joined, media
+        lists are concatenated. The first event of a burst owns the dispatch;
+        later events wait for it and inherit its admission verdict, so every
+        sidecar event is acked only after the merged message was admitted (and
+        stays unacked/replayable if it was not).
+        """
+        if self._burst_quiet_s <= 0:
+            await self.handle_message(message_event)
+            return
+        key = (message_event.source.chat_id, message_event.user_id or "")
+        # Sending a message ends that typing session; a new indicator will
+        # arrive if they keep typing.
+        self._typing_until.pop(key, None)
+        burst = self._bursts.get(key)
+        if burst is not None:
+            burst.absorb(message_event)
+            accepted = await asyncio.shield(burst.result)
+            message_event._gateway_accepted = accepted  # type: ignore[attr-defined]
+            return
+        burst = _InboundBurst(message_event)
+        self._bursts[key] = burst
+        try:
+            try:
+                await burst.wait_quiet(
+                    self._burst_quiet_s,
+                    self._burst_max_s,
+                    lambda: self._typing_until.get(key, 0.0),
+                )
+            finally:
+                # Close the window synchronously so a later event starts a
+                # new burst instead of joining one that is being dispatched.
+                if self._bursts.get(key) is burst:
+                    del self._bursts[key]
+            await self.handle_message(burst.event)
+        except BaseException:
+            if not burst.result.done():
+                burst.result.set_exception(SidecarUnavailable("burst_dispatch_failed"))
+                burst.result.exception()  # mark retrieved; members re-raise it
+            raise
+        if not burst.result.done():
+            burst.result.set_result(getattr(burst.event, "_gateway_accepted", False) is True)
 
     async def _accept_reaction(self, event: Dict[str, Any]) -> None:
         await self._forward_platform_event(event)
@@ -803,8 +949,22 @@ def validate_config(config: Dict[str, Any]) -> tuple[bool, str]:
     return True, ""
 
 
-def is_connected(adapter: Any) -> bool:
-    return isinstance(adapter, RustPushIMessageAdapter) and adapter.is_connected
+def is_connected(target: Any) -> bool:
+    """Registry ``is_connected``: Hermes calls this with a ``PlatformConfig``
+    ("has the user configured this platform?"), e.g. from
+    ``GatewayConfig.get_connected_platforms`` and the cron delivery preflight.
+    The old adapter-only check returned False for every config, so cron
+    treated iMessage as unconnected and blocked all scheduled deliveries.
+    A live adapter still reports its own connection state."""
+    if isinstance(target, RustPushIMessageAdapter):
+        return target.is_connected
+    extra = getattr(target, "extra", None)
+    if extra is None and isinstance(target, dict):
+        extra = target.get("extra", target)
+    if not isinstance(extra, dict):
+        return False
+    ok, _reason = validate_config(extra)
+    return ok
 
 
 def register(ctx) -> None:
@@ -819,7 +979,79 @@ def register(ctx) -> None:
         is_connected=is_connected,
         allowed_users_env="RUSTPUSH_ALLOWED_USERS",
         allow_all_env="RUSTPUSH_ALLOW_ALL_USERS",
+        # Lets cron jobs deliver here (deliver=imessage_cli or an explicit
+        # imessage_cli:<chat_id>). Without it the scheduler's preflight treats
+        # the platform as unknown and blocks every scheduled message.
+        cron_deliver_env_var="IMESSAGE_CLI_HOME_CHANNEL",
         max_message_length=RustPushIMessageAdapter.MAX_MESSAGE_LENGTH,
         allow_update_command=False,
         pii_safe=True,
     )
+
+
+def _bounded_float(raw: Any, default: float, low: float, high: float) -> float:
+    try:
+        value = float(raw) if raw is not None else default
+    except (TypeError, ValueError):
+        value = default
+    if value != value:  # NaN
+        value = default
+    return min(max(value, low), high)
+
+
+_PLACEHOLDER_TEXTS = {"[Attachment]", "[Attachment unavailable]"}
+
+
+class _InboundBurst:
+    """A pending group of inbound events from one sender in one chat."""
+
+    def __init__(self, first: MessageEvent) -> None:
+        self.event = first
+        self.started = time.monotonic()
+        self.last = self.started
+        self._bumped = asyncio.Event()
+        self.result: asyncio.Future = asyncio.get_running_loop().create_future()
+
+    def absorb(self, incoming: MessageEvent) -> None:
+        merged = self.event
+        texts = [t for t in (merged.text, incoming.text) if t and t not in _PLACEHOLDER_TEXTS]
+        if texts:
+            merged.text = "\n\n".join(texts)
+        elif incoming.text and not merged.text:
+            merged.text = incoming.text
+        merged.media_urls.extend(incoming.media_urls)
+        merged.media_types.extend(incoming.media_types)
+        if merged.media_types:
+            merged.message_type = _message_type(merged.media_types)
+        # Thread any reply to the newest message in the burst.
+        merged.message_id = incoming.message_id
+        if incoming.reply_to_message_id and not merged.reply_to_message_id:
+            merged.reply_to_message_id = incoming.reply_to_message_id
+        raw, extra_raw = merged.raw_message, incoming.raw_message
+        if isinstance(raw, dict) and isinstance(extra_raw, dict):
+            for field in ("attachment_count", "declared_attachment_count", "unavailable_attachment_count"):
+                raw[field] = int(raw.get(field) or 0) + int(extra_raw.get(field) or 0)
+            raw["burst_size"] = int(raw.get("burst_size") or 1) + 1
+        self.last = time.monotonic()
+        self._bumped.set()
+
+    def wake(self) -> None:
+        """Re-evaluate the deadline (typing state changed)."""
+        self._bumped.set()
+
+    async def wait_quiet(
+        self, quiet_s: float, max_s: float, typing_until: Callable[[], float] = lambda: 0.0
+    ) -> None:
+        """Return once the sender went quiet: no new event for ``quiet_s`` and
+        no active typing indicator, or ``max_s`` elapsed since the first event."""
+        while True:
+            now = time.monotonic()
+            settle = max(self.last + quiet_s, typing_until())
+            timeout = min(settle - now, self.started + max_s - now)
+            if timeout <= 0:
+                return
+            self._bumped.clear()
+            try:
+                await asyncio.wait_for(self._bumped.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
