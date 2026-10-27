@@ -417,6 +417,38 @@ class AdapterContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("mark_read", operations)
         self.assertEqual(operations[-1], "ack")
 
+    async def test_inbound_message_satisfies_native_admission_metadata_contract(self) -> None:
+        # Hermes native admission (gateway.session_envelope) refuses any
+        # MessageEvent.metadata key outside its closed contract with
+        # ``invalid_params (metadata)``; adapter diagnostics ride raw_message.
+        try:
+            from gateway.session_envelope import _native_metadata
+        except ImportError:  # pragma: no cover - older Hermes without native admission
+            self.skipTest("Hermes checkout has no native admission envelope")
+        accepted = []
+
+        async def handle(event):
+            accepted.append(event)
+
+        self.adapter.handle_message = handle  # type: ignore[method-assign]
+        await self.adapter._on_event(
+            self.message(
+                group_name="Family",
+                received_monotonic_ns=100,
+                participants=["mailto:peer@example.com"],
+                from_me=False,
+                attachments=[],
+            )
+        )
+        for _ in range(100):  # bursts flush on the event loop even with a zero quiet window
+            if accepted:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(len(accepted), 1)
+        self.assertEqual(_native_metadata(accepted[0]), {})
+        self.assertEqual(accepted[0].raw_message["group_name"], "Family")
+        self.assertEqual(accepted[0].raw_message["received_monotonic_ns"], 100)
+
     async def test_inbound_attachment_materializes_and_removes_object_replacement_text(self) -> None:
         accepted = []
         source = Path(self.tmp.name) / "photo.jpg"

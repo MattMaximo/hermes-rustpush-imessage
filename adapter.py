@@ -572,22 +572,23 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
             message_type=message_type,
             message_id=native_id,
             timestamp=timestamp,
+            # Adapter diagnostics stay in raw_message: Hermes native admission
+            # refuses any MessageEvent.metadata key outside its closed contract
+            # (``invalid_params (metadata)``), which dropped every inbound text.
             raw_message={
                 "event_kind": "message",
                 "attachment_count": len(media_urls),
                 "declared_attachment_count": declared_attachment_count,
                 "unavailable_attachment_count": unavailable_attachment_count,
                 "has_reply": bool(event.get("reply_to")),
+                "group_name": event.get("group_name"),
+                "received_monotonic_ns": event.get("received_monotonic_ns"),
             },
             media_urls=media_urls,
             media_types=media_types,
             reply_to_message_id=(
                 event.get("reply_to") if isinstance(event.get("reply_to"), str) else None
             ),
-            metadata={
-                "imessage_group_name": event.get("group_name"),
-                "imessage_received_monotonic_ns": event.get("received_monotonic_ns"),
-            },
         )
         try:
             await self._dispatch_inbound(message_event)
