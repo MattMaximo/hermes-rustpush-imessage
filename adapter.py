@@ -514,10 +514,18 @@ class RustPushIMessageAdapter(BasePlatformAdapter):
                         continue
                     materialized = Path(raw_path)
                     data = materialized.read_bytes()
+                    att_name = str(item.get("filename") or item.get("name") or "attachment.bin")
+                    att_mime = str(item.get("mime") or "application/octet-stream")
+                    # iPhone photos arrive as HEIC, which the gateway's image
+                    # validator rejects (magic-byte allowlist), silently turning
+                    # every camera photo into "[Attachment unavailable]".
+                    data, att_name, att_mime = await asyncio.to_thread(
+                        _heic_to_jpeg, data, att_name, att_mime
+                    )
                     cached = cache_media_bytes(
                         data,
-                        filename=str(item.get("filename") or item.get("name") or "attachment.bin"),
-                        mime_type=str(item.get("mime") or "application/octet-stream"),
+                        filename=att_name,
+                        mime_type=att_mime,
                     )
                     if cached is not None:
                         # Hermes' CachedMedia exposes ``media_type``; older
@@ -996,6 +1004,46 @@ def _bounded_float(raw: Any, default: float, low: float, high: float) -> float:
     if value != value:  # NaN
         value = default
     return min(max(value, low), high)
+
+
+_HEIF_MIMES = {"image/heic", "image/heif", "image/heic-sequence", "image/heif-sequence"}
+_HEIF_BRANDS = {b"heic", b"heix", b"hevc", b"hevx", b"heim", b"heis", b"mif1", b"msf1"}
+
+
+def _is_heif(data: bytes, mime: str) -> bool:
+    if mime.lower() in _HEIF_MIMES:
+        return True
+    return len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in _HEIF_BRANDS
+
+
+def _heic_to_jpeg(data: bytes, filename: str, mime: str) -> tuple[bytes, str, str]:
+    """Convert HEIC/HEIF to JPEG with macOS ``sips``; pass anything else through.
+
+    On any conversion failure the original bytes are returned unchanged so the
+    gateway's normal handling (and its error path) still applies.
+    """
+    if not _is_heif(data, mime):
+        return data, filename, mime
+    import subprocess
+    import tempfile
+
+    try:
+        with tempfile.TemporaryDirectory(prefix="imsg-heic-") as tmp:
+            src = Path(tmp) / "in.heic"
+            dst = Path(tmp) / "out.jpg"
+            src.write_bytes(data)
+            result = subprocess.run(
+                ["/usr/bin/sips", "-s", "format", "jpeg", str(src), "--out", str(dst)],
+                capture_output=True,
+                timeout=30,
+            )
+            if result.returncode != 0 or not dst.is_file():
+                LOGGER.warning("HEIC->JPEG conversion failed (rc=%s)", result.returncode)
+                return data, filename, mime
+            return dst.read_bytes(), (Path(filename).stem or "photo") + ".jpg", "image/jpeg"
+    except Exception as exc:  # never drop the attachment because conversion broke
+        LOGGER.warning("HEIC->JPEG conversion error: %s", type(exc).__name__)
+        return data, filename, mime
 
 
 _PLACEHOLDER_TEXTS = {"[Attachment]", "[Attachment unavailable]"}
